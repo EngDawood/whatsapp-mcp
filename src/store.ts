@@ -779,6 +779,54 @@ export class Store {
     return out.sort((a, b) => b.last_ts - a.last_ts).slice(0, opts.limit);
   }
 
+  /**
+   * What happened in each chat between `from` and `to`, for an end-of-day summary: every chat with a message in
+   * the window, how many came in and went out, whether the other side is still waiting at the end of the window
+   * (same rule as unanswered: my reaction counts as a reply, theirs doesn't count as a message), and the window's
+   * messages oldest first, the latest `perChat` of them. Chats still waiting come first, then the most recent.
+   * Groups, channels and broadcasts only with `groups`.
+   */
+  digest(opts: { from: number; to: number; groups: boolean; perChat: number; maxChats: number }) {
+    const s = this.snapshot();
+    const byChat = new Map<string, { id: string; ts: number; from_me: number; sender: string | null; type: string; data: ArrayBuffer }[]>();
+    const rows = this.sql.exec<{ id: string; chat: string; ts: number; from_me: number; sender: string | null; type: string; data: ArrayBuffer }>(
+      `SELECT id, chat, ts, from_me, sender, type, data FROM messages WHERE ts >= ? AND ts < ? ORDER BY ts ASC`, opts.from, opts.to,
+    );
+    for (const r of rows) {
+      let list = byChat.get(r.chat);
+      if (!list) byChat.set(r.chat, (list = []));
+      list.push(r);
+    }
+    const out: {
+      jid: string; name: string; is_group: number; incoming: number; outgoing: number; first_ts: number; last_ts: number;
+      waiting: number; waiting_since: number | null; earlier: number;
+      messages: { id: string; ts: number; sender: string; body: string; media: boolean }[];
+    }[] = [];
+    for (const [cid, list] of byChat) {
+      const rec = s.chats.get(cid);
+      if (!rec) continue;
+      const direct = !rec.group && /@(s\.whatsapp\.net|lid)$/.test(rec.jid);
+      if (!direct && !opts.groups) continue;
+      const counted = list.filter((r) => r.from_me || r.type !== 'reaction');
+      const lastMine = counted.map((r) => r.from_me).lastIndexOf(1);
+      const theirs = direct ? counted.slice(lastMine + 1) : [];
+      const shown = list.filter((r) => r.type !== 'reaction');
+      const kept = shown.slice(-opts.perChat);
+      out.push({
+        jid: rec.jid, name: this.nameOf(rec.jid, s).name, is_group: rec.group,
+        incoming: shown.filter((r) => !r.from_me).length, outgoing: shown.filter((r) => r.from_me).length,
+        first_ts: list[0].ts, last_ts: list[list.length - 1].ts,
+        waiting: theirs.length, waiting_since: theirs.length ? theirs[0].ts : null, earlier: shown.length - kept.length,
+        messages: kept.map((r) => {
+          const blob = this.vault.open<MsgBlob>(r.data, MSG);
+          return { id: r.id, ts: r.ts, sender: this.senderLabel(r, blob, s), body: blob.b, media: Boolean(blob.m) };
+        }),
+      });
+    }
+    out.sort((a, b) => Number(b.waiting > 0) - Number(a.waiting > 0) || b.last_ts - a.last_ts);
+    return { chats: out.slice(0, opts.maxChats), total: out.length };
+  }
+
   private blobOf(chat: string, id: string): { cid: string; ts: number; blob: MsgBlob } | null {
     const cid = this.pj(chat);
     const r = this.sql.exec<{ ts: number; data: ArrayBuffer }>(`SELECT ts, data FROM messages WHERE chat = ? AND id = ?`, cid, id).toArray()[0];

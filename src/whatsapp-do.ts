@@ -325,6 +325,7 @@ export class WhatsAppStore extends DurableObject<Env> {
   counts() { return this.store.counts(); }
   unnamedChats(limit: number) { return this.store.unnamedChats(limit); }
   unanswered(o: Parameters<Store['unanswered']>[0]) { return this.store.unanswered(o); }
+  digest(o: Parameters<Store['digest']>[0]) { return this.store.digest(o); }
   setNames(rows: { jid: string; name: string }[]) { return this.store.setCustomNames(rows); }
 
   // ---------- media ----------

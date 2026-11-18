@@ -4,6 +4,7 @@ import { initSchema, isLegacy, matches, migrateLegacy, parseQuery, Store } from 
 import { sqliteAuthState } from '../src/auth-state.ts';
 import { decryptMedia } from '../src/media.ts';
 import { limitsOf, verdict } from '../src/limits.ts';
+import { addDays, zoneMidnight, zoneToday } from '../src/zone.ts';
 import { createAccount, KDF_ITERATIONS, KEY_STRETCH, newToken, PBKDF2_PASS, openAccount, rewrap, tokenId, unwrapForToken, Vault, wrapForToken } from '../src/vault.ts';
 
 // ---------- a SqlStorage lookalike ----------
@@ -503,6 +504,44 @@ for (const [i, cc, want] of cases) check(`toJid(${JSON.stringify(i)}, ${cc})`, t
   const bad = Buffer.from(file); bad[5] ^= 1;
   check('a tampered file is refused', (await decryptMedia(bad, mediaKey, 'audio')) === null);
 }
+
+// ---------- daily digest ----------
+{
+  const { sql: dsql } = makeSql();
+  initSchema(dsql);
+  const ds = new Store(dsql, (fn) => fn(), vault);
+  const ALI = '966500000001@s.whatsapp.net', SARA = '966500000002@s.whatsapp.net', OLD = '966500000003@s.whatsapp.net', GRP = '1234@g.us';
+  const DAY = 1_000_000; // the window is [DAY, DAY + 86400)
+  ds.ingestMessages([
+    M('o1', OLD, DAY - 3600, 'yesterday, no answer yet'),
+    M('a1', ALI, DAY + 100, 'price for 3 units?', false, { pushName: 'Ali' }), M('a2', ALI, DAY + 200, 'and delivery?'),
+    M('s1', SARA, DAY - 7200, 'order shipped?'), M('s2', SARA, DAY + 300, 'yes, today', true), M('s3', SARA, DAY + 400, 'thanks'),
+    M('g1', GRP, DAY + 500, 'team meeting at 5', false, { key: { participant: ALI } }),
+    M('late', ALI, DAY + 86400 + 10, 'next day'),
+  ]);
+  ds.ingestMessages([{ key: { id: 'r1', remoteJid: SARA, fromMe: true }, messageTimestamp: DAY + 450, message: { reactionMessage: { key: { id: 's3' }, text: '👍', senderTimestampMs: (DAY + 450) * 1000 } } } as any]);
+  const d = ds.digest({ from: DAY, to: DAY + 86400, groups: false, perChat: 20, maxChats: 50 });
+  const by = Object.fromEntries(d.chats.map((c: any) => [c.jid, c]));
+  check('digest covers only direct chats active in the window', d.total === 2 && by[ALI] && by[SARA] && !by[OLD] && !by[GRP], d.chats.map((c: any) => c.jid));
+  check('a customer still waiting comes first, with counts', d.chats[0].jid === ALI && by[ALI].waiting === 2 && by[ALI].incoming === 2 && by[ALI].outgoing === 0 && by[ALI].waiting_since === DAY + 100, by[ALI]);
+  check('my reaction counts as an answer', by[SARA].waiting === 0 && by[SARA].incoming === 1 && by[SARA].outgoing === 1, by[SARA]);
+  check('messages outside the window and reactions are not shown', !by[ALI].messages.some((m: any) => m.id === 'late') && !by[SARA].messages.some((m: any) => m.id === 'r1' || m.id === 's1'));
+  check('messages read oldest first, with names', by[ALI].messages.map((m: any) => m.body).join('|') === 'price for 3 units?|and delivery?' && by[SARA].messages[0].sender === 'Me');
+  const g = ds.digest({ from: DAY, to: DAY + 86400, groups: true, perChat: 1, maxChats: 50 });
+  const gc = g.chats.find((c: any) => c.jid === GRP) as any;
+  check('groups only when asked, never counted as waiting', g.total === 3 && gc && gc.waiting === 0 && gc.is_group === 1, g.chats.map((c: any) => c.jid));
+  check('per_chat keeps the latest and counts the rest', (g.chats.find((c: any) => c.jid === ALI) as any).messages[0].id === 'a2' && (g.chats.find((c: any) => c.jid === ALI) as any).earlier === 1);
+  check('maxChats caps the list but not the total', ds.digest({ from: DAY, to: DAY + 86400, groups: false, perChat: 5, maxChats: 1 }).chats.length === 1);
+}
+
+// ---------- days in the user's timezone ----------
+check('midnight in Riyadh is 21:00 UTC the day before', zoneMidnight('2026-11-18', 'Asia/Riyadh') === Date.UTC(2026, 10, 17, 21) / 1000);
+check('midnight in UTC', zoneMidnight('2026-03-01', 'UTC') === Date.UTC(2026, 2, 1) / 1000);
+check('a day that starts in summer time', zoneMidnight('2026-07-01', 'Europe/Amsterdam') === Date.UTC(2026, 5, 30, 22) / 1000);
+check('the day after a DST change starts at the new offset', zoneMidnight('2026-03-30', 'Europe/Amsterdam') === Date.UTC(2026, 2, 29, 22) / 1000);
+check('today follows the zone, not UTC', zoneToday('Asia/Riyadh', Date.UTC(2026, 10, 17, 22)) === '2026-11-18' && zoneToday('UTC', Date.UTC(2026, 10, 17, 22)) === '2026-11-17');
+check('adding days crosses months and years', addDays('2026-12-31', 1) === '2027-01-01' && addDays('2026-03-01', -1) === '2026-02-28');
+check('a bad date is refused', throws(() => zoneMidnight('18/11/2026', 'UTC')) && throws(() => addDays('nope', 1)));
 
 console.log(failed ? `\n${failed} FAILED` : '\nall passed');
 process.exit(failed ? 1 : 0);

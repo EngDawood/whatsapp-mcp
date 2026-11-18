@@ -6,6 +6,7 @@ import type { Env, McpProps } from './index.js';
 import type { WhatsAppStore } from './whatsapp-do.js';
 import { unlockedStub } from './auth.js';
 import { toJid } from './phone.js';
+import { addDays, zoneMidnight, zoneToday } from './zone.js';
 
 const STALE_MS = 10 * 60_000;
 
@@ -37,7 +38,7 @@ const TEXTUAL = /^(text\/|application\/(json|xml|csv)\b)/;
 
 const displayNumber = (jid: string) => (jid.endsWith('@s.whatsapp.net') ? `+${jid.replace('@s.whatsapp.net', '')}` : jid);
 
-function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: string, TZ: string) {
+export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: string, TZ: string) {
   const canTranscribe = Boolean(env.AI);
   const fmt = new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle: 'short', timeStyle: 'short' });
   const when = (ts: number) => fmt.format(new Date(ts * 1000));
@@ -176,6 +177,63 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
         (r) => `${r.name} | ${r.waiting}${r.more ? '+' : ''} waiting since ${when(r.since)} | last ${when(r.last_ts)}: "${oneLine(r.last, 160)}" | ${r.jid}`,
       );
       return text(note + `${rows.length} direct chats waiting on a reply:\n${lines.join('\n')}`);
+    },
+  );
+
+  server.registerTool(
+    'daily_digest',
+    {
+      description:
+        "Everything that happened in the user's chats on one day, for an end-of-day summary or a reminder of who still needs an answer. " +
+        `Days are in ${TZ}; the default is today. For each direct chat active that day: messages in and out, whether the other person is still ` +
+        'waiting on a reply and since when, and that day\'s messages, oldest first. Chats still waiting come first. It also lists direct chats ' +
+        'that have been waiting since earlier days, which are the easiest to forget. Summarize from this one call rather than reading chats one by one. ' +
+        'Groups are left out unless include_groups is true.',
+      inputSchema: {
+        date: z.string().optional().describe(`YYYY-MM-DD in ${TZ}. Default: today`),
+        days: z.number().int().min(1).max(7).default(1).describe('How many days, ending on `date`. 7 gives the week up to and including `date`'),
+        include_groups: z.boolean().default(false),
+        per_chat: z.number().int().min(1).max(100).default(20).describe('Most messages shown per chat; the latest ones are kept'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ date, days, include_groups, per_chat }) => {
+      const note = await fresh();
+      const last = date ?? zoneToday(TZ);
+      const firstDay = addDays(last, -(days - 1));
+      const from = zoneMidnight(firstDay, TZ), to = zoneMidnight(addDays(last, 1), TZ);
+      const [{ chats, total }, ua] = await Promise.all([
+        wa.digest({ from, to, groups: include_groups, perChat: per_chat, maxChats: 50 }),
+        wa.unanswered({ since: from - 14 * 86400, limit: 100 }) as Promise<Rows>,
+      ]);
+      // a chat waiting since before the window: say since when, not just since its first message that day
+      const waitingSince = new Map(ua.map((r) => [r.jid as string, r.since as number]));
+      const stamp = days === 1 ? (ts: number) => when(ts).slice(11) : when;
+      const span = days === 1 ? last : `${firstDay} to ${last}`;
+
+      const block = (c: (typeof chats)[number]) => {
+        const since = waitingSince.get(c.jid) ?? c.waiting_since;
+        const head =
+          `### ${c.name}${c.is_group ? ' [group]' : ''} (${displayNumber(c.jid)}): ${c.incoming} in, ${c.outgoing} out` +
+          (c.waiting ? `, WAITING on the user since ${since ? when(since) : '?'}` : '');
+        const lines = c.messages.map((m) => `[${stamp(m.ts)}] ${m.sender}: ${clip(m.body, 500)}${mediaTag(m)}`);
+        return [head, ...(c.earlier ? [`(${c.earlier} earlier messages that day not shown)`] : []), ...lines].join('\n');
+      };
+      const waiting = chats.filter((c) => c.waiting);
+      const rest = chats.filter((c) => !c.waiting);
+      const inWindow = new Set(chats.map((c) => c.jid));
+      const older = ua.filter((r) => !inWindow.has(r.jid) && r.since < from);
+
+      const out = [`# ${span} (${TZ}): ${total} chat${total === 1 ? '' : 's'} active, ${waiting.length} waiting on a reply`];
+      if (total > chats.length) out.push(`(showing the ${chats.length} most relevant)`);
+      if (!chats.length) out.push('No messages in this period.');
+      if (waiting.length) out.push('', '## Waiting on the user', ...waiting.map(block));
+      if (rest.length) out.push('', '## Answered, or nothing to answer', ...rest.map(block));
+      if (older.length) {
+        out.push('', '## Still waiting from earlier days');
+        for (const r of older) out.push(`${r.name} (${displayNumber(r.jid)}) | ${r.waiting}${r.more ? '+' : ''} waiting since ${when(r.since)} | last: "${oneLine(r.last, 160)}"`);
+      }
+      return text(note + out.join('\n'));
     },
   );
 
