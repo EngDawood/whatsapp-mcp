@@ -9,6 +9,9 @@
 	"observability": {
 		"enabled": true
 	},
+	
+	"workers_dev": true
+	,
 	// Baileys needs three things workerd doesn't have. See "What to know before changing things" in the README.
 	"alias": {
 		"ws": "./src/ws-shim.ts",
