@@ -1,10 +1,10 @@
 /**
  * Who someone is, and how their data key travels with them. Two modes, picked by config:
  *
- *   - Single user (set the OWNER_PASSWORD secret): one account named "owner", for people running their own copy.
- *     The first sign-in with OWNER_PASSWORD creates the account; after that the account's own password is what
+ *   - Single user (set the WA_OWNER_PASSWORD secret): one account named "owner", for people running their own copy.
+ *     The first sign-in with WA_OWNER_PASSWORD creates the account; after that the account's own password is what
  *     counts (it starts out the same). The password is what unlocks the data (see vault.ts).
- *   - Many users (leave OWNER_PASSWORD unset and set OPEN_SIGNUP=true): people sign in with Google through a
+ *   - Many users (leave WA_OWNER_PASSWORD unset and set OPEN_SIGNUP=true): people sign in with Google through a
  *     login service (finereli-login by default). The service says who they are and hands this server a data key
  *     for them, the same on every login, so there is no password to type or lose. The catch is that the service's
  *     operator can derive that key: the data is encrypted at rest, not hidden from whoever runs the service.
@@ -26,7 +26,7 @@ export interface AuthEnv {
   OAUTH_KV: KVNamespace;
   WA: DurableObjectNamespace<WhatsAppStore>;
   REGISTRY: DurableObjectNamespace<Registry>;
-  OWNER_PASSWORD?: string;
+  WA_OWNER_PASSWORD?: string;
   /** "true" to run for many people, signing in through the login service. Many-user mode has to be asked for. */
   OPEN_SIGNUP?: string;
   /** The login service that says who someone is and hands over their data key. Defaults to finereli's. */
@@ -58,10 +58,10 @@ export async function sameSecret(a: string, b: string) {
   return (crypto.subtle as any).timingSafeEqual(x, y) as boolean;
 }
 
-export const isSingleUser = (env: AuthEnv) => Boolean(env.OWNER_PASSWORD);
+export const isSingleUser = (env: AuthEnv) => Boolean(env.WA_OWNER_PASSWORD);
 export { serverMode };
 export type { Mode } from './limits.js';
-export const NOT_SET_UP = 'This server has no sign-in configured. Its owner needs to set OWNER_PASSWORD (for one person), or OPEN_SIGNUP=true (for many).';
+export const NOT_SET_UP = 'This server has no sign-in configured. Its owner needs to set WA_OWNER_PASSWORD (for one person), or OPEN_SIGNUP=true (for many).';
 export const MIN_PASSWORD = 12;
 
 /** One Durable Object per person. In many-user mode it is found by a hash of their Google id, so no email is kept. */
@@ -119,7 +119,7 @@ export async function signIn(env: AuthEnv, form: { password: string }, timezone:
   if (retryAfter > 0) return fail(`Too many wrong passwords. Try again in ${Math.ceil(retryAfter / 1000)} seconds.`, 429);
 
   if (!record) {
-    if (env.OWNER_PASSWORD!.length >= MIN_PASSWORD && (await sameSecret(password, env.OWNER_PASSWORD!))) {
+    if (env.WA_OWNER_PASSWORD!.length >= MIN_PASSWORD && (await sameSecret(password, env.WA_OWNER_PASSWORD!))) {
       const made = await createAccount(password);
       if (await stub.createAccount(made.record, env.TIMEZONE ?? timezone)) return { ok: true, who: { userId, dek: made.dek } };
       return signIn(env, form, timezone); // lost a race with another first sign-in; it exists now

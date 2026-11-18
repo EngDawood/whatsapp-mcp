@@ -8,9 +8,9 @@
 import type { AuthEnv } from './auth.js';
 
 export type Mode = 'single' | 'multi' | 'unset';
-/** One person (OWNER_PASSWORD), many people (OPEN_SIGNUP), or not set up, in which case nobody can sign in. */
-export const serverMode = (env: Pick<AuthEnv, 'OWNER_PASSWORD' | 'OPEN_SIGNUP'>): Mode =>
-  env.OWNER_PASSWORD ? 'single' : env.OPEN_SIGNUP === 'true' ? 'multi' : 'unset';
+/** One person (WA_OWNER_PASSWORD), many people (OPEN_SIGNUP), or not set up, in which case nobody can sign in. */
+export const serverMode = (env: Pick<AuthEnv, 'WA_OWNER_PASSWORD' | 'OPEN_SIGNUP'>): Mode =>
+  env.WA_OWNER_PASSWORD ? 'single' : env.OPEN_SIGNUP === 'true' ? 'multi' : 'unset';
 
 export interface Limits { messages: number; bytes: number }
 

@@ -23,7 +23,8 @@
   ],
 
   // The OAuth provider's token store. Create it, then paste the id:
-  //   npx wrangler kv namespace create OAUTH_KV
+  //   npx wrangler kv namespace create WA_OAUTH_KV   (the namespace name in your account; the binding stays OAUTH_KV,
+  //   because @cloudflare/workers-oauth-provider reads env.OAUTH_KV and has no option to change it)
   "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "REPLACE_WITH_KV_NAMESPACE_ID" }],
 
   // First history import decodes a lot of protobuf; the default CPU budget is too small. Needs Workers Paid.
@@ -33,8 +34,8 @@
   // so syncing happens when an agent asks (see "Things to know" in the README).
 
   // Sign-in. Pick one:
-  //   - Just you: `npx wrangler secret put OWNER_PASSWORD` (12+ characters). The first sign-in creates your account.
-  //   - Many people: leave OWNER_PASSWORD unset and set the var "OPEN_SIGNUP": "true". People sign in with Google
+  //   - Just you: `npx wrangler secret put WA_OWNER_PASSWORD` (12+ characters). The first sign-in creates your account.
+  //   - Many people: leave WA_OWNER_PASSWORD unset and set the var "OPEN_SIGNUP": "true". People sign in with Google
   //     through a login service ("LOGIN_URL", default https://login.finereli.com) that also gives the server a
   //     data key for them. The service's operator can derive those keys; see the README.
   //   With neither, nobody can sign in.

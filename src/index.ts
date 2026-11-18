@@ -32,7 +32,7 @@ export { Registry } from './registry.js';
 export interface Env extends AuthEnv {
   OAUTH_PROVIDER: OAuthHelpers;
   /** Optional secret for machine access to /debug. 32+ random characters. */
-  PIN?: string;
+  WA_PIN?: string;
   /** Shown on the privacy page as who runs this server. Optional. */
   OPERATOR_NAME?: string;
   /** Country code (digits, no +) for phone numbers given without one, e.g. "972". */
@@ -72,9 +72,9 @@ const noteSeats = (taken: number) => { seatCache = { at: Date.now(), taken }; };
 
 function pinOk(request: Request, env: Env) {
   const sent = request.headers.get('x-pin');
-  if (!sent || !env.PIN || env.PIN.length < 32 || sent.length !== env.PIN.length) return false;
+  if (!sent || !env.WA_PIN || env.WA_PIN.length < 32 || sent.length !== env.WA_PIN.length) return false;
   let diff = 0;
-  for (let i = 0; i < sent.length; i++) diff |= sent.charCodeAt(i) ^ env.PIN.charCodeAt(i);
+  for (let i = 0; i < sent.length; i++) diff |= sent.charCodeAt(i) ^ env.WA_PIN.charCodeAt(i);
   return diff === 0;
 }
 
@@ -264,7 +264,7 @@ export default {
   fetch: (request: Request, env: Env, ctx: ExecutionContext) => oauth.fetch(request, env, ctx),
   /**
    * Once a day, write the seat and waitlist counts, and yesterday's signups and deletions, to the log, where the operator (or their agent, through
-   * Cloudflare's API) can read them without the PIN. Counts only.
+   * Cloudflare's API) can read them without WA_PIN. Counts only.
    */
   async scheduled(_event: ScheduledController, env: Env) {
     if (serverMode(env) !== 'multi') return;

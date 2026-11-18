@@ -38,7 +38,7 @@ Your messages live in a SQLite database inside a Durable Object in Cloudflare, o
 **It only reads.** There are no tools that send, edit or delete anything in WhatsApp.
 
 **Your messages are encrypted at rest. Whether the operator can read them depends on how it is run.**
-- **Your own copy** (`OWNER_PASSWORD`): the key comes from your password. There is no master key and no recovery key. Not Cloudflare, and not someone who copies the database, can read your stored messages without it.
+- **Your own copy** (`WA_OWNER_PASSWORD`): the key comes from your password. There is no master key and no recovery key. Not Cloudflare, and not someone who copies the database, can read your stored messages without it.
 - **A hosted service** (`OPEN_SIGNUP`): people sign in with Google through a login service (login.finereli.com) that hands the server a key for them, the same key every time. A leaked database, a stolen backup or a peek inside the hosting account shows noise. The login service's operator can derive that key, so the encryption is not a lock against them. They say so, the code is open source, and running your own copy removes the question.
 - Each account has a random data key. It encrypts everything you own: message text, chat and contact names, the names your agent saves, and WhatsApp's session keys.
 - The data key is stored only in a form locked by that password or login key (PBKDF2-SHA256, 600,000 rounds for a password, run as six chained passes of 100,000 because Cloudflare caps each call there, then AES-256-GCM). Someone who copies the database can't read your stored messages without it.
@@ -70,10 +70,10 @@ cd whatsapp-mcp
 npm install
 
 # 1. A place for the sign-in tokens. Paste the id it prints into wrangler.jsonc.
-npx wrangler kv namespace create OAUTH_KV
+npx wrangler kv namespace create WA_OAUTH_KV
 
 # 2. A password for your account. 12+ characters. This is what locks your messages.
-npx wrangler secret put OWNER_PASSWORD
+npx wrangler secret put WA_OWNER_PASSWORD
 
 # 3. Deploy.
 npm run deploy
@@ -92,7 +92,7 @@ Wrangler prints your URL, something like `https://whatsapp-mcp.your-name.workers
 
    The front page also has Claude, ChatGPT and Grok buttons. Each copies a message ("Set up WhatsApp for me via your-url. Read your-url/llms.txt and walk me through it.") and opens the assistant, so you paste it there. `/llms.txt` is a plain-text page written for the assistant: where the MCP endpoint is, the steps the person has to do themselves, and what to tell them honestly.
 
-The first sign-in with `OWNER_PASSWORD` creates your account. After that your account's own password is what counts, so changing the secret later does nothing. If you want your own domain, see the comments at the bottom of `wrangler.jsonc`.
+The first sign-in with `WA_OWNER_PASSWORD` creates your account. After that your account's own password is what counts, so changing the secret later does nothing. If you want your own domain, see the comments at the bottom of `wrangler.jsonc`.
 
 ### Run it with Docker
 
@@ -101,7 +101,7 @@ The same Worker runs on your own machine under workerd, Cloudflare's open source
 ```sh
 git clone https://github.com/finereli/whatsapp-mcp
 cd whatsapp-mcp
-cp .env.example .env    # set PUBLIC_HOST and OWNER_PASSWORD
+cp .env.example .env    # set PUBLIC_HOST and WA_OWNER_PASSWORD
 docker compose up -d --build
 ```
 
@@ -110,7 +110,7 @@ Point your tunnel or proxy at the published port (`127.0.0.1:8787` by default; `
 Things that differ from Cloudflare:
 - `./data` is everything: messages, the WhatsApp session, agents' tokens. Back it up together with `.env`; without the password the backup can't be read, and without the backup there is nothing to read.
 - `wrangler dev` is a development server. It holds up fine for one person, but there is no fleet behind it: if the machine is down, so is your agent's WhatsApp.
-- Set `PIN` in `.env` to use `/debug` (`curl -H "x-pin: $PIN" http://127.0.0.1:8787/debug`), which shows the pairing log when a link fails.
+- Set `WA_PIN` in `.env` to use `/debug` (`curl -H "x-pin: $WA_PIN" http://127.0.0.1:8787/debug`), which shows the pairing log when a link fails.
 
 ### The Workers Paid note
 
@@ -118,7 +118,7 @@ Importing a large history decodes a lot of data in one go, and the default CPU l
 
 ### Upgrading from an earlier version
 
-The first version stored messages in plain text. The first sign-in after you deploy this one encrypts everything already stored, in one step that either completes or changes nothing. Sign in with `OWNER_PASSWORD`; that password becomes the one that locks your data. The Google login option is gone, because a key can't be made from a login service. The daily background pull is gone too, for the reason in the next section.
+The first version stored messages in plain text. The first sign-in after you deploy this one encrypts everything already stored, in one step that either completes or changes nothing. Sign in with `WA_OWNER_PASSWORD`; that password becomes the one that locks your data. The Google login option is gone, because a key can't be made from a login service. The daily background pull is gone too, for the reason in the next section.
 
 ## Things to know
 
@@ -142,7 +142,7 @@ The first version stored messages in plain text. The first sign-in after you dep
 
 ## Running it for other people
 
-The same code runs as a service for many people. Leave `OWNER_PASSWORD` unset and set `OPEN_SIGNUP=true`. With neither set, nobody can sign in, so a deployment that forgot to choose can't become a free service for strangers. People sign in with Google through a login service (login.finereli.com by default; point `LOGIN_URL` at your own). The service says who they are and gives the server a data key for them, derived from a secret only the service holds, so there is no password to type or lose. The server keeps an anonymous id made from their Google account id, never their email. Each person gets their own Durable Object, their own key, and no way to see anyone else's data. The honest limit: whoever runs the login service can derive every key, so say so to your users, and know that this protects against leaks, not against you.
+The same code runs as a service for many people. Leave `WA_OWNER_PASSWORD` unset and set `OPEN_SIGNUP=true`. With neither set, nobody can sign in, so a deployment that forgot to choose can't become a free service for strangers. People sign in with Google through a login service (login.finereli.com by default; point `LOGIN_URL` at your own). The service says who they are and gives the server a data key for them, derived from a secret only the service holds, so there is no password to type or lose. The server keeps an anonymous id made from their Google account id, never their email. Each person gets their own Durable Object, their own key, and no way to see anyone else's data. The honest limit: whoever runs the login service can derive every key, so say so to your users, and know that this protects against leaks, not against you.
 
 The login service has to list your origin in its `ALLOWED_ORIGINS`, and it must return a key from `/exchange` when asked (`{code, key: true}`). Writing your own is small: the key is `HKDF-SHA256(secret, salt = your origin, info = the person's Google id)`, returned only to a server (never a browser), and the secret must never change.
 
@@ -162,7 +162,7 @@ A service for strangers needs limits, so there are three, all optional variables
 
 To hear when seats run out, turn on [Email Routing](https://developers.cloudflare.com/email-routing/) for your domain, verify your address there, and add a `send_email` binding named `ALERT_EMAIL` with that address as `destination_address`, plus the vars `ALERT_TO` (the same address) and `ALERT_FROM` (any address on your domain). You get an email at 80 percent of `SIGNUP_LIMIT` and another when it's full. Messages contain counts and nothing about anyone.
 
-When every seat is taken, the front page says so and offers a waitlist instead of a signup. The list is at `/debug?u=waitlist` (needs the PIN); `POST /debug?u=waitlist&remove=<email>` takes someone off it. With a daily cron trigger, the seat and waitlist counts are written to the log once a day.
+When every seat is taken, the front page says so and offers a waitlist instead of a signup. The list is at `/debug?u=waitlist` (needs WA_PIN); `POST /debug?u=waitlist&remove=<email>` takes someone off it. With a daily cron trigger, the seat and waitlist counts are written to the log once a day.
 
 What it costs, from Cloudflare's published prices (estimates, not measured on a real fleet):
 
@@ -337,7 +337,7 @@ These all cost real time to find. Read them before touching the Baileys parts.
 
 | Name | Kind | Purpose |
 | --- | --- | --- |
-| `OWNER_PASSWORD` | secret | Single-user mode: set it and the server is for one person. 12+ characters. The first sign-in creates the account. Leave it unset for many-user mode. |
+| `WA_OWNER_PASSWORD` | secret | Single-user mode: set it and the server is for one person. 12+ characters. The first sign-in creates the account. Leave it unset for many-user mode. |
 | `OPEN_SIGNUP` | var, optional | `"true"` turns on many-user mode: Google sign-in through the login service. |
 | `LOGIN_URL` | var, optional | The login service. Defaults to `https://login.finereli.com`. |
 | `SIGNUP_LIMIT` | var, optional | Most accounts in many-user mode. Unset or `0`: no cap. |
@@ -347,7 +347,7 @@ These all cost real time to find. Read them before touching the Baileys parts.
 | `OPERATOR_NAME` | var, optional | Shown on the privacy page and terms as who runs this server. |
 | `TIMEZONE` | var, optional | IANA zone for timestamps in single-user mode. Otherwise each account uses the zone of the browser it signed up from. |
 | `DEFAULT_COUNTRY_CODE` | var, optional | Country code (digits, no plus), used when your agent saves a number written without one, e.g. `972`. |
-| `PIN` | secret, optional | 32+ random characters. Enables the `/debug` routes via an `x-pin` header. Leave it unset to leave them off. |
+| `WA_PIN` | secret, optional | 32+ random characters. Enables the `/debug` routes via an `x-pin` header. Leave it unset to leave them off. |
 | `OAUTH_KV` | binding | Token store for the OAuth provider and pending sign-ins. |
 | `WA` | binding | The per-person Durable Object. |
 | `REGISTRY` | binding | One Durable Object that counts accounts, so `SIGNUP_LIMIT` is a real cap. |
@@ -367,9 +367,9 @@ Lost that file, or deploying from a new machine? `CLOUDFLARE_API_TOKEN=... node 
 
 ## Debugging
 
-With `PIN` set, `/debug` returns JSON and needs the header `x-pin: <PIN>`. Add `?u=<user id>` for a many-user deployment (the id is the hash the object is named by; single-user mode needs nothing). It shows session phase, whether a phone is linked, whether the object currently has a key, the message count, and the last events from the session (connection changes, history chunk sizes, errors). It shows no message content, because the operator has no key, and that is on purpose. There are no routes to read chats, run SQL or pull: they would need a key.
+With `WA_PIN` set, `/debug` returns JSON and needs the header `x-pin: <WA_PIN>`. Add `?u=<user id>` for a many-user deployment (the id is the hash the object is named by; single-user mode needs nothing). It shows session phase, whether a phone is linked, whether the object currently has a key, the message count, and the last events from the session (connection changes, history chunk sizes, errors). It shows no message content, because the operator has no key, and that is on purpose. There are no routes to read chats, run SQL or pull: they would need a key.
 
-Local development: `npm run dev` with a `.dev.vars` containing `OWNER_PASSWORD=...` (12+ characters). It runs a local Durable Object with its own empty storage, so you can exercise the sign-in flow and see a real QR code, but linking a phone from local dev makes a second linked device.
+Local development: `npm run dev` with a `.dev.vars` containing `WA_OWNER_PASSWORD=...` (12+ characters). It runs a local Durable Object with its own empty storage, so you can exercise the sign-in flow and see a real QR code, but linking a phone from local dev makes a second linked device.
 
 To test the pairing UI states without a phone, serve the page with a mocked `/pair/status`. Everything the page needs is that one JSON shape: `paired`, `running`, `progress`, `qrSvg`, `messages`, `chats`.
 

@@ -305,9 +305,9 @@ check('nothing readable is left after migrating', !['plaintext secret', 'Gilad',
 // ---------- size limits ----------
 
 const MB = 1024 * 1024;
-const many = { OWNER_PASSWORD: undefined, SIGNUP_LIMIT: '100', OPEN_SIGNUP: 'true' } as any;
+const many = { WA_OWNER_PASSWORD: undefined, SIGNUP_LIMIT: '100', OPEN_SIGNUP: 'true' } as any;
 check('many-user mode has default caps', limitsOf(many).messages === 250_000 && limitsOf(many).bytes === 300 * MB, limitsOf(many));
-check('single-user mode has none', limitsOf({ OWNER_PASSWORD: 'x'.repeat(12) } as any).messages === 0 && limitsOf({ OWNER_PASSWORD: 'x'.repeat(12) } as any).bytes === 0);
+check('single-user mode has none', limitsOf({ WA_OWNER_PASSWORD: 'x'.repeat(12) } as any).messages === 0 && limitsOf({ WA_OWNER_PASSWORD: 'x'.repeat(12) } as any).bytes === 0);
 check('settings override the defaults', limitsOf({ ...many, MAX_MESSAGES: '1000', MAX_DB_MB: '5' }).messages === 1000 && limitsOf({ ...many, MAX_MESSAGES: '1000', MAX_DB_MB: '5' }).bytes === 5 * MB);
 check('0 turns a cap off', limitsOf({ ...many, MAX_MESSAGES: '0', MAX_DB_MB: '0' }).messages === 0);
 check('nonsense falls back to the default', limitsOf({ ...many, MAX_MESSAGES: 'lots' }).messages === 250_000);
