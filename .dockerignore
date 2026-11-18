@@ -1,0 +1,14 @@
+node_modules
+.wrangler
+vendor
+.git
+data
+.env
+.dev.vars
+# private files a working copy may have; they must not end up in an image
+.owner-secret
+wrangler.local.jsonc
+wrangler.*.local.jsonc
+local-export/auth
+local-export/exports
+secrets
