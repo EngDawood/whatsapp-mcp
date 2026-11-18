@@ -120,7 +120,8 @@ export class WhatsAppStore extends DurableObject<Env> {
     this.ctx.storage.sql.exec(`UPDATE account SET v = ? WHERE k = 'record'`, JSON.stringify(record));
   }
 
-  timezone(): string { return this.meta('tz') ?? 'UTC'; }
+  /** TIMEZONE, when set, wins over the zone saved at sign-up, so a wrong first guess can be fixed without a new account. */
+  timezone(): string { return this.env.TIMEZONE || this.meta('tz') || 'UTC'; }
   /** Is a phone linked? Remembered in the clear because it is asked before there is a key. */
   isPaired(): boolean { return this.meta('paired') === '1'; }
 

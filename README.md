@@ -345,7 +345,7 @@ These all cost real time to find. Read them before touching the Baileys parts.
 | `ALERT_EMAIL`, `ALERT_TO`, `ALERT_FROM` | send_email binding and vars, optional | Where to email the operator when seats run low and run out. |
 | `CONTACT_X` | var, optional | Your X handle, shown where people are told to get in touch. |
 | `OPERATOR_NAME` | var, optional | Shown on the privacy page and terms as who runs this server. |
-| `TIMEZONE` | var, optional | IANA zone for timestamps in single-user mode. Otherwise each account uses the zone of the browser it signed up from. |
+| `TIMEZONE` | var, optional | IANA zone for timestamps, e.g. `Asia/Riyadh`. When set it wins over the zone saved at sign-up, so it can be set or changed after the account exists. Otherwise each account uses the zone of the browser it signed up from. |
 | `DEFAULT_COUNTRY_CODE` | var, optional | Country code (digits, no plus), used when your agent saves a number written without one, e.g. `972`. |
 | `WA_PIN` | secret, optional | 32+ random characters. Enables the `/debug` routes via an `x-pin` header. Leave it unset to leave them off. |
 | `OAUTH_KV` | binding | Token store for the OAuth provider and pending sign-ins. |
