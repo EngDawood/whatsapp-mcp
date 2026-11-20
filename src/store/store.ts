@@ -7,6 +7,7 @@
  * and the real values live inside sealed blobs. Names are therefore resolved here, in memory, from a decrypted
  * snapshot of the small tables, and search decrypts and scans (see search()).
  */
+import { RpcTarget } from 'cloudflare:workers';
 import { jidNormalizedUser } from '@whiskeysockets/baileys';
 import { translate, type MediaKind, type MediaRef, type Quote, type ReactEvent, type MessageEvent } from '../whatsapp/translate.js';
 import type { proto } from '@whiskeysockets/baileys';
@@ -268,7 +269,11 @@ export interface SearchHit { id: string; chat: string; chat_name: string; ts: nu
 
 type Snapshot = NameSources & { names: Names };
 
-export class Store {
+/**
+ * The message store for one account. An RpcTarget so the Worker can query it through Account.history(); its public
+ * methods are its interface, instance fields stay private to the Durable Object.
+ */
+export class Store extends RpcTarget {
   private snap: Snapshot | null = null;
   private stats: Map<string, { n: number; last: number }> | null = null;
   private aliasMap: Map<string, string> | null = null;
@@ -276,6 +281,7 @@ export class Store {
   private index: SearchIndex;
 
   constructor(private sql: SqlStorage, private tx: <T>(fn: () => T) => T, private vault: Vault) {
+    super();
     this.index = new SearchIndex(sql, vault, (data) => vault.open<MsgBlob>(data, MSG).b);
   }
 

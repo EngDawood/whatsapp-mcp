@@ -291,14 +291,15 @@ const js = String.raw`
       if (!j.messages.length) msgs.appendChild(h('div', 'placeholder', 'No messages.'));
       msgs.appendChild(render(j.messages));
       state.oldest = j.messages.length ? j.messages[0] : null;
+      state.older = j.older;
       msgs.scrollTop = msgs.scrollHeight;
     }).catch(fail);
   }
 
   function older(btn) {
     var jid = state.chat, first = state.oldest;
-    if (!first) return;
-    api('/api/messages?chat=' + enc(jid) + '&limit=80&before=' + first.ts + '&beforeId=' + enc(first.id)).then(function (j) {
+    if (!first || !state.older) return;
+    api('/api/messages?chat=' + enc(jid) + '&limit=80&before=' + enc(state.older)).then(function (j) {
       if (state.chat !== jid) return;
       var h0 = msgs.scrollHeight;
       btn.remove();
@@ -308,6 +309,7 @@ const js = String.raw`
       if (j.more) frag.insertBefore(moreButton(older), frag.firstChild);
       msgs.insertBefore(frag, msgs.firstChild);
       if (j.messages.length) state.oldest = j.messages[0];
+      state.older = j.older;
       msgs.scrollTop += msgs.scrollHeight - h0;
     }).catch(fail);
   }
@@ -322,6 +324,7 @@ const js = String.raw`
       msgs.appendChild(moreButton(older));
       msgs.appendChild(render(j.messages, { hit: id }));
       state.oldest = j.messages.length ? j.messages[0] : null;
+      state.older = state.oldest ? new Date(state.oldest.ts * 1000).toISOString() + '#' + state.oldest.id : null;
       var newer = h('button', 'load more', 'Jump to latest'); newer.type = 'button';
       newer.onclick = function () { openChat(jid, name, state.isGroup); };
       msgs.appendChild(newer);

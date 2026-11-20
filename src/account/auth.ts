@@ -75,11 +75,12 @@ export const seatRegistry = (env: AuthEnv) => env.REGISTRY.get(env.REGISTRY.idFr
 
 export const accountStub = (env: AuthEnv, userId: string) => env.WA.get(env.WA.idFromName(userId));
 
-/** The same stub, unlocked with the person's data key. */
-export async function unlockedStub(env: AuthEnv, who: Identity | { userId: string; dek: string }) {
-  const stub = accountStub(env, who.userId);
-  await stub.unlock(typeof who.dek === 'string' ? who.dek : who.dek.toString('base64'));
-  return stub;
+/**
+ * The person's open account (an RPC stub to whatsapp/account.ts), opened with their data key. The only way to reach
+ * anything keyed. Throws 'wrong key' or 'no account'.
+ */
+export function unlockAccount(env: AuthEnv, who: Identity | { userId: string; dek: string }) {
+  return accountStub(env, who.userId).open(typeof who.dek === 'string' ? who.dek : who.dek.toString('base64'));
 }
 
 // ---------- sign-in steps that wait on a page ----------

@@ -252,22 +252,28 @@ Don't log a key, put one in a URL, or store one anywhere that outlives a session
 
 | File | Job |
 | --- | --- |
-| `src/index.ts` | Routes. OAuth provider wiring, sign-in, pairing endpoints, deleting an account, `/debug`. |
-| `src/vault.ts` | Keys: password to account record, sealing and opening, pseudonymous ids, tokens that carry a key. |
-| `src/auth.ts` | Accounts and sessions. Single-user mode or many-user mode, password sign-in and the login service, the KV-backed sessions that carry the key. |
-| `src/limits.ts` | The mode (one person, many, not set up) and the per-account size caps: what is over, and whether to turn an account away or stop adding to it. |
-| `src/registry.ts` | The seat counter behind `SIGNUP_LIMIT`, and the waitlist. |
-| `src/notify.ts` | Emails the operator through the `ALERT_EMAIL` binding. |
-| `src/brand.ts` | The logo as the Worker serves it: the SVG, the PNG icons and the social card, embedded so a deployment needs no static hosting. |
-| `src/phone.ts` | Phone numbers in any format to WhatsApp jids. |
-| `src/whatsapp-do.ts` | The Durable Object. Holds the account record, unlocks with a key, runs Baileys sessions, exposes RPC methods for the Worker. |
-| `src/store.ts` | Schema, ingesting Baileys events into SQLite, every query, search, and the migration from the plaintext version. |
-| `src/search-index.ts` | The keyed Bloom filters that let search skip blocks it can't match. |
-| `src/auth-state.ts` | Baileys auth state backed by the DO's SQLite and sealed (replaces `useMultiFileAuthState`). |
-| `src/mcp.ts` | The MCP tools, and the hint that points agents at the naming tools. |
-| `src/chats-page.ts` | The read-only chat viewer at `/chats` (its JSON calls are `chatsApi` in `src/index.ts`). |
-| `src/pages.ts`, `src/landing.ts`, `src/privacy.ts`, `src/tos.ts`, `src/ui.ts` | All HTML. `ui.ts` has the shared design tokens. |
-| `src/ws-shim.ts`, `src/lru-shim.ts`, `src/polyfills.ts` | Make Baileys run on workerd. See below. |
+| `src/index.ts` | Entry point. The `Env` bindings, OAuth provider wiring (`/mcp` goes to the MCP server, everything else to `web/routes.ts`), the daily stats log. |
+| `src/account/vault.ts` | Keys: password to account record, sealing and opening, pseudonymous ids, tokens that carry a key. |
+| `src/account/auth.ts` | Accounts and sessions. Single-user mode or many-user mode, password sign-in and the login service, the KV-backed sessions that carry the key, `unlockAccount`. |
+| `src/account/limits.ts` | The mode (one person, many, not set up) and the per-account size caps: what is over, and whether to turn an account away or stop adding to it. |
+| `src/account/registry.ts` | The seat counter behind `SIGNUP_LIMIT`, and the waitlist. |
+| `src/account/notify.ts` | Emails the operator through the `ALERT_EMAIL` binding. |
+| `src/whatsapp/whatsapp-do.ts` | The Durable Object, keyless part: the account record, login throttling, flags. `open(key)` checks the key and returns the open `Account`. |
+| `src/whatsapp/account.ts` | The open `Account` (an RPC target): everything that needs the key. Baileys sessions (pull, pairing), media, transcripts, and `history()` for the store. |
+| `src/whatsapp/translate.ts` | WhatsApp's message format to plain events (message, reaction, edit, delete): content types, captions, media keys, quoted replies. Pure. |
+| `src/whatsapp/auth-state.ts` | Baileys auth state backed by the DO's SQLite and sealed (replaces `useMultiFileAuthState`). |
+| `src/whatsapp/media.ts`, `src/whatsapp/transcribe.ts` | Downloading and decrypting files from WhatsApp's CDN; voice notes to text on Workers AI. |
+| `src/whatsapp/phone.ts` | Phone numbers in any format to WhatsApp jids. |
+| `src/store/store.ts` | Schema, applying events to SQLite, every query, search, notes, and the migration from the plaintext version. |
+| `src/store/names.ts` | Who a chat or person is: one ranking for chat and sender names, placeholders, number format. |
+| `src/store/search-index.ts` | The keyed Bloom filters that let search skip blocks it can't match. |
+| `src/history/history.ts` | The History reader: the read rules both front ends share (which chat a name means, when to pull, default windows, paging cursors, dates). |
+| `src/history/connect.ts`, `src/history/zone.ts` | Opening an account behind a reader for one request; day windows in the owner's time zone. |
+| `src/mcp/server.ts` | The MCP tools (an adapter over the reader), and the hint that points agents at the naming tools. |
+| `src/web/routes.ts` | Pages and sign-in, the waitlist, `/debug`. `pair-api.ts` is the pairing calls, `chats-api.ts` the chat viewer's calls, `guard.ts` who is asking. |
+| `src/web/chats-page.ts` | The read-only chat viewer at `/chats`. |
+| `src/web/pages.ts`, `landing.ts`, `privacy.ts`, `tos.ts`, `ui.ts`, `brand.ts`, `http.ts`, `seats.ts` | All HTML and the bits around it. `ui.ts` has the shared design tokens. |
+| `src/platform/ws-shim.ts`, `lru-shim.ts`, `polyfills.ts` | Make Baileys run on workerd. See below. |
 | `scripts/vendor-bridge.mjs` | Extracts the wasm from Baileys' Rust bridge. Runs on `npm install`. |
 | `scripts/pull-config.mjs` | Rebuilds `wrangler.local.jsonc` from the live Worker. |
 | `Dockerfile`, `compose.yml`, `docker/entrypoint.sh` | Running it under `wrangler dev` on your own machine. |
