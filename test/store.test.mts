@@ -1,6 +1,7 @@
 // Runs the real Store against node:sqlite (a stand-in for the Durable Object's SqlStorage).
 import { DatabaseSync } from 'node:sqlite';
 import { initSchema, isLegacy, matches, migrateLegacy, parseQuery, Store } from '../src/store.ts';
+import { core, fold } from '../src/search-index.ts';
 import { sqliteAuthState } from '../src/auth-state.ts';
 import { decryptMedia } from '../src/media.ts';
 import { limitsOf, verdict } from '../src/limits.ts';
@@ -503,6 +504,49 @@ for (const [i, cc, want] of cases) check(`toJid(${JSON.stringify(i)}, ${cc})`, t
   check('the wrong media type does not', (await decryptMedia(file, mediaKey, 'image')) === null);
   const bad = Buffer.from(file); bad[5] ^= 1;
   check('a tampered file is refused', (await decryptMedia(bad, mediaKey, 'audio')) === null);
+}
+
+// ---------- Arabic search ----------
+{
+  check('tatweel, alef maqsura, ta marbuta and Arabic-Indic digits fold away', fold('مـرحبا مستشفى فاتورة ٠٥٥١۲') === fold('مرحبا مستشفي فاتوره 05512') && fold('٠٥٥١۲') === '05512');
+  check('hamza forms and diacritics fold as before', fold('أحمد إبراهيم آمنة مُحَمَّد') === 'احمد ابراهيم امنه محمد');
+  check('prefixes come off the front', ['وبالطلب', 'الطلب', 'للطلب', 'والطلب', 'فالطلب', 'كالطلب', 'طلب'].every((w) => core(w) === 'طلب'));
+  check('short words keep their prefix-like letters', core('الله') === 'الله' && core('وطن') === 'وطن' && core('الحب') === 'الحب');
+  check('words that start with و or ف keep them', core('فاتوره') === 'فاتوره' && core('وزير') === 'وزير' && core('والفاتوره') === 'فاتوره');
+  check('other scripts are untouched', core('order') === 'order' && core('alarm') === 'alarm');
+
+  const { sql: asql } = makeSql();
+  initSchema(asql);
+  const as = new Store(asql, (fn) => fn(), vault);
+  const C1 = '966511111111@s.whatsapp.net', C2 = '966522222222@s.whatsapp.net';
+  as.ingestMessages([
+    M('x1', C1, 10, 'وصلني الطلب أمس، شكراً'),
+    M('x2', C1, 20, 'مـرحبا، كم سعر الفاتورة؟'),
+    M('x3', C2, 30, 'رقمي ٠٥٥١٢٣٤٥٦٧'),
+    M('x4', C2, 40, 'سأرسل للمستشفى غدا'),
+    M('x5', C2, 50, 'الله يعطيك العافية'),
+  ]);
+  const ids = (q: string) => as.search({ queries: [q], limit: 10 }).hits[0].map((h) => h.id).sort().join(',');
+  check('a plain word finds it with ال and و attached', ids('طلب') === 'x1' && ids('الطلب') === 'x1' && ids('وبالطلب') === 'x1');
+  check('مرحبا finds مـرحبا', ids('مرحبا') === 'x2');
+  check('فاتوره finds الفاتورة', ids('فاتوره') === 'x2' && ids('الفاتورة') === 'x2');
+  check('ASCII digits find Arabic-Indic ones', ids('0551234567') === 'x3' && ids('٠٥٥١٢٣٤٥٦٧') === 'x3');
+  check('مستشفي finds للمستشفى', ids('مستشفي') === 'x4' && ids('المستشفى') === 'x4');
+  check('a prefix search works through ال', ids('مستش*') === 'x4' && ids('الفات*') === 'x2');
+  check('short words are not stripped into other words', ids('له') === '' && ids('الله') === 'x5');
+  check('phrases still need their words in order', ids('"سعر الفاتورة"') === 'x2' && ids('"الفاتورة سعر"') === '');
+}
+
+// a store indexed before the Arabic rules is rebuilt on its first search
+{
+  const { sql: osql } = makeSql();
+  initSchema(osql);
+  const os = new Store(osql, (fn) => fn(), vault);
+  os.ingestMessages([M('y1', '966533333333@s.whatsapp.net', 10, 'وبالطلب')]);
+  os.search({ queries: ['x'], limit: 1 }); // builds the index
+  osql.exec(`UPDATE meta SET v = '1' WHERE k = 'search_index'`);
+  const fresh = new Store(osql, (fn) => fn(), vault);
+  check('an old index is rebuilt and finds the new matches', fresh.search({ queries: ['طلب'], limit: 5 }).hits[0].length === 1 && (osql.exec(`SELECT v FROM meta WHERE k = 'search_index'`).toArray()[0] as any).v === '2');
 }
 
 // ---------- daily digest ----------

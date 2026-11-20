@@ -10,7 +10,7 @@
 import { getContentType, normalizeMessageContent, jidNormalizedUser } from '@whiskeysockets/baileys';
 import type { proto } from '@whiskeysockets/baileys';
 import type { Vault } from './vault.js';
-import { SearchIndex, fold, needsOf, words } from './search-index.js';
+import { SearchIndex, core, fold, needsOf, words } from './search-index.js';
 
 // What each kind of blob is bound to, so one can't be swapped for another.
 const MSG = 'm', CHAT = 'c', CONTACT = 'k', NAME = 'n', ALIAS = 'l';
@@ -274,7 +274,7 @@ export function describe(msg: proto.IWebMessageInfo): { type: string; body: stri
 /** One search term: a word, or a quoted phrase. A trailing * on a word matches any word that starts with it. */
 interface Term { tokens: string[]; prefix: boolean }
 
-/** Plain words are AND-ed; "quoted phrases" must appear in order; word* is a prefix. Every word is matched whole, case and accents aside. */
+/** Plain words are AND-ed; "quoted phrases" must appear in order; word* is a prefix. Every word is matched whole, case, accents and Arabic prefixes aside (see core). */
 export function parseQuery(q: string): Term[] {
   const out: Term[] = [];
   for (const raw of q.match(/"[^"]*"|\S+/g) ?? []) {
@@ -290,7 +290,8 @@ function hasTerm(have: string[], t: Term): boolean {
   const n = t.tokens.length;
   outer: for (let i = 0; i + n <= have.length; i++) {
     for (let j = 0; j < n; j++) {
-      const ok = j === n - 1 && t.prefix ? have[i + j].startsWith(t.tokens[j]) : have[i + j] === t.tokens[j];
+      const w = have[i + j], q = t.tokens[j];
+      const ok = j === n - 1 && t.prefix ? w.startsWith(q) || core(w).startsWith(core(q)) : core(w) === core(q);
       if (!ok) continue outer;
     }
     return true;
@@ -301,7 +302,8 @@ function hasTerm(have: string[], t: Term): boolean {
 /** Does this text satisfy every term? The cheap substring check runs first so most messages never get tokenized. */
 export function matches(text: string, terms: Term[]): boolean {
   const flat = fold(text);
-  if (!terms.every((t) => t.tokens.every((tok) => flat.includes(tok)))) return false;
+  // every match contains the query word's core (prefixes only ever come off the front), so this never rules out a hit
+  if (!terms.every((t) => t.tokens.every((tok) => flat.includes(core(tok))))) return false;
   const have = flat.match(/[\p{L}\p{N}]+/gu) ?? [];
   return terms.every((t) => hasTerm(have, t));
 }
