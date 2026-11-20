@@ -185,6 +185,10 @@ The risk to weigh: every linked device connects from Cloudflare's datacenter add
 | `get_messages` | Read one chat. Page back or forward by date. |
 | `search_messages` | Search across everything, or within one chat. Takes a list of queries and answers them in one pass. |
 | `unanswered_chats` | Direct chats where the other person wrote last and you haven't replied. |
+| `daily_digest` | One day (or up to 7) in one call, for an end-of-day summary: reminders due, per chat messages in and out and open notes, who is still waiting on a reply and since when, and chats still waiting from earlier days. Days follow `TIMEZONE`. |
+| `save_note` | Remember something about a customer or a follow-up, optionally with a day to be reminded (`remind_on`). Stored encrypted, like messages. Nothing goes to WhatsApp. |
+| `list_notes` | Saved notes, reminders soonest first; filter by chat or by day due. |
+| `update_note` | Mark a note done, change its text or reminder day, or delete it. |
 | `get_media` | Fetch the photo, voice note, video or document behind a message. |
 | `transcribe_audio` | Voice notes to text, kept with the message. Only with a Workers AI binding. |
 | `unnamed_chats` | Chats known only by phone number, busiest first, with the last thing the other person said. |
@@ -345,7 +349,7 @@ These all cost real time to find. Read them before touching the Baileys parts.
 | `ALERT_EMAIL`, `ALERT_TO`, `ALERT_FROM` | send_email binding and vars, optional | Where to email the operator when seats run low and run out. |
 | `CONTACT_X` | var, optional | Your X handle, shown where people are told to get in touch. |
 | `OPERATOR_NAME` | var, optional | Shown on the privacy page and terms as who runs this server. |
-| `TIMEZONE` | var, optional | IANA zone for timestamps in single-user mode. Otherwise each account uses the zone of the browser it signed up from. |
+| `TIMEZONE` | var, optional | IANA zone for timestamps, e.g. `Asia/Riyadh`. When set it wins over the zone saved at sign-up, so it can be set or changed after the account exists. Otherwise each account uses the zone of the browser it signed up from. |
 | `DEFAULT_COUNTRY_CODE` | var, optional | Country code (digits, no plus), used when your agent saves a number written without one, e.g. `972`. |
 | `WA_PIN` | secret, optional | 32+ random characters. Enables the `/debug` routes via an `x-pin` header. Leave it unset to leave them off. |
 | `OAUTH_KV` | binding | Token store for the OAuth provider and pending sign-ins. |

@@ -120,7 +120,8 @@ export class WhatsAppStore extends DurableObject<Env> {
     this.ctx.storage.sql.exec(`UPDATE account SET v = ? WHERE k = 'record'`, JSON.stringify(record));
   }
 
-  timezone(): string { return this.meta('tz') ?? 'UTC'; }
+  /** TIMEZONE, when set, wins over the zone saved at sign-up, so a wrong first guess can be fixed without a new account. */
+  timezone(): string { return this.env.TIMEZONE || this.meta('tz') || 'UTC'; }
   /** Is a phone linked? Remembered in the clear because it is asked before there is a key. */
   isPaired(): boolean { return this.meta('paired') === '1'; }
 
@@ -278,7 +279,7 @@ export class WhatsAppStore extends DurableObject<Env> {
     await this.logout();
     // chat_stats and lid_senders go first, so deleting the messages doesn't run the stats triggers row by row
     this.ctx.storage.sql.exec(`DROP TRIGGER IF EXISTS chat_stats_ad`);
-    for (const t of ['chat_stats', 'lid_senders', 'messages', 'chats', 'contacts', 'custom_names', 'alias']) this.ctx.storage.sql.exec(`DELETE FROM ${t}`);
+    for (const t of ['chat_stats', 'lid_senders', 'messages', 'chats', 'contacts', 'custom_names', 'alias', 'notes']) this.ctx.storage.sql.exec(`DELETE FROM ${t}`);
     initSchema(this.ctx.storage.sql); // puts the trigger back
     this.keyed().store.reset();
   }
@@ -324,6 +325,11 @@ export class WhatsAppStore extends DurableObject<Env> {
   counts() { return this.store.counts(); }
   unnamedChats(limit: number) { return this.store.unnamedChats(limit); }
   unanswered(o: Parameters<Store['unanswered']>[0]) { return this.store.unanswered(o); }
+  digest(o: Parameters<Store['digest']>[0]) { return this.store.digest(o); }
+  addNote(jid: string | null, text: string, due: number | null) { return this.store.addNote(jid, text, due); }
+  notes(o: Parameters<Store['notes']>[0]) { return this.store.notes(o); }
+  updateNote(id: number, patch: Parameters<Store['updateNote']>[1]) { return this.store.updateNote(id, patch); }
+  deleteNote(id: number) { return this.store.deleteNote(id); }
   setNames(rows: { jid: string; name: string }[]) { return this.store.setCustomNames(rows); }
 
   // ---------- media ----------

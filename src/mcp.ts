@@ -6,6 +6,8 @@ import type { Env, McpProps } from './index.js';
 import type { WhatsAppStore } from './whatsapp-do.js';
 import { unlockedStub } from './auth.js';
 import { toJid } from './phone.js';
+import { addDays, zoneMidnight, zoneToday } from './zone.js';
+import type { Note } from './store.js';
 
 const STALE_MS = 10 * 60_000;
 
@@ -37,10 +39,14 @@ const TEXTUAL = /^(text\/|application\/(json|xml|csv)\b)/;
 
 const displayNumber = (jid: string) => (jid.endsWith('@s.whatsapp.net') ? `+${jid.replace('@s.whatsapp.net', '')}` : jid);
 
-function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: string, TZ: string) {
+export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: string, TZ: string) {
   const canTranscribe = Boolean(env.AI);
   const fmt = new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle: 'short', timeStyle: 'short' });
   const when = (ts: number) => fmt.format(new Date(ts * 1000));
+  const dayOf = (ts: number) => when(ts).slice(0, 10);
+  /** One note as a line; `withChat` names the chat, for lists that mix chats. */
+  const noteLine = (n: Note, withChat = false) =>
+    `#${n.id}${withChat && n.name ? ` ${n.name}` : ''}${n.due ? ` (remind ${dayOf(n.due)})` : ''}${n.done ? ' [done]' : ''}: ${oneLine(n.text, 400)}`;
   const server = new McpServer(
     { name: 'whatsapp-mcp', version: '0.0.1' },
     {
@@ -49,7 +55,10 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
         `Each read first pulls anything new from WhatsApp if the store is more than a few minutes old. ` +
         `Use list_chats to find a chat, get_messages to read it, search_messages to find things across chats, unanswered_chats for direct messages still waiting on a reply. ` +
         `Photos, voice notes, videos, documents and stickers show as labels with a media id; get_media fetches the file` +
-        `${canTranscribe ? ' and transcribe_audio turns voice notes into text' : ''}. ${NAME_HINT}`,
+        `${canTranscribe ? ' and transcribe_audio turns voice notes into text' : ''}. ` +
+        `daily_digest gives a whole day in one call for an end-of-day summary. When the user tells you something worth remembering about a customer ` +
+        `(what they want, a promise, a day to follow up), save it with save_note, with remind_on for a follow-up; notes and due reminders show up in ` +
+        `daily_digest and get_messages, and list_notes / update_note manage them. Notes stay on this server; nothing is sent to WhatsApp. ${NAME_HINT}`,
       maxToolInputElements: 10_000,
     },
   );
@@ -113,8 +122,11 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
       if (matches.length > 1 && !chat.includes('@')) {
         return text(note + `"${chat}" matches several chats, pick one by jid:\n` + matches.map((m) => `${m.name} | ${m.jid}`).join('\n'));
       }
-      const rows = (await wa.getMessages({ chat: matches[0].jid, limit, before: epoch(before), after: epoch(after) })) as Rows;
-      const head = `# ${matches[0].name} (${rows.length} messages)\n`;
+      const [rows, notes] = await Promise.all([
+        wa.getMessages({ chat: matches[0].jid, limit, before: epoch(before), after: epoch(after) }) as Promise<Rows>,
+        wa.notes({ jid: matches[0].jid, open: true, limit: 20 }) as Promise<Note[]>,
+      ]);
+      const head = `# ${matches[0].name} (${rows.length} messages)\n` + (notes.length ? `Notes: ${notes.map((n) => noteLine(n)).join(' | ')}\n` : '');
       return text(note + head + rows.map((r) => `[${when(r.ts)}] ${r.sender}: ${r.body}${mediaTag(r)}`).join('\n'));
     },
   );
@@ -179,6 +191,73 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
     },
   );
 
+  server.registerTool(
+    'daily_digest',
+    {
+      description:
+        "Everything that happened in the user's chats on one day, for an end-of-day summary or a reminder of who still needs an answer. " +
+        'It starts with saved notes whose reminder day has come (overdue ones marked), and shows each chat\'s open notes. ' +
+        `Days are in ${TZ}; the default is today. For each direct chat active that day: messages in and out, whether the other person is still ` +
+        'waiting on a reply and since when, and that day\'s messages, oldest first. Chats still waiting come first. It also lists direct chats ' +
+        'that have been waiting since earlier days, which are the easiest to forget. Summarize from this one call rather than reading chats one by one. ' +
+        'Groups are left out unless include_groups is true.',
+      inputSchema: {
+        date: z.string().optional().describe(`YYYY-MM-DD in ${TZ}. Default: today`),
+        days: z.number().int().min(1).max(7).default(1).describe('How many days, ending on `date`. 7 gives the week up to and including `date`'),
+        include_groups: z.boolean().default(false),
+        per_chat: z.number().int().min(1).max(100).default(20).describe('Most messages shown per chat; the latest ones are kept'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ date, days, include_groups, per_chat }) => {
+      const note = await fresh();
+      const last = date ?? zoneToday(TZ);
+      const firstDay = addDays(last, -(days - 1));
+      const from = zoneMidnight(firstDay, TZ), to = zoneMidnight(addDays(last, 1), TZ);
+      const [{ chats, total }, ua, notes] = await Promise.all([
+        wa.digest({ from, to, groups: include_groups, perChat: per_chat, maxChats: 50 }),
+        wa.unanswered({ since: from - 14 * 86400, limit: 100 }) as Promise<Rows>,
+        wa.notes({ open: true, limit: 500 }) as Promise<Note[]>,
+      ]);
+      const notesOf = new Map<string, Note[]>();
+      for (const n of notes) if (n.jid) notesOf.set(n.jid, [...(notesOf.get(n.jid) ?? []), n]);
+      const due = notes.filter((n) => n.due !== null && n.due < to);
+      // a chat waiting since before the window: say since when, not just since its first message that day
+      const waitingSince = new Map(ua.map((r) => [r.jid as string, r.since as number]));
+      const stamp = days === 1 ? (ts: number) => when(ts).slice(11) : when;
+      const span = days === 1 ? last : `${firstDay} to ${last}`;
+
+      const block = (c: (typeof chats)[number]) => {
+        const since = waitingSince.get(c.jid) ?? c.waiting_since;
+        const head =
+          `### ${c.name}${c.is_group ? ' [group]' : ''} (${displayNumber(c.jid)}): ${c.incoming} in, ${c.outgoing} out` +
+          (c.waiting ? `, WAITING on the user since ${since ? when(since) : '?'}` : '');
+        const lines = c.messages.map((m) => `[${stamp(m.ts)}] ${m.sender}: ${clip(m.body, 500)}${mediaTag(m)}`);
+        const own = notesOf.get(c.jid) ?? [];
+        return [head, ...own.map((n) => `Note ${noteLine(n)}`), ...(c.earlier ? [`(${c.earlier} earlier messages that day not shown)`] : []), ...lines].join('\n');
+      };
+      const waiting = chats.filter((c) => c.waiting);
+      const rest = chats.filter((c) => !c.waiting);
+      const inWindow = new Set(chats.map((c) => c.jid));
+      const older = ua.filter((r) => !inWindow.has(r.jid) && r.since < from);
+
+      const out = [`# ${span} (${TZ}): ${total} chat${total === 1 ? '' : 's'} active, ${waiting.length} waiting on a reply`];
+      if (total > chats.length) out.push(`(showing the ${chats.length} most relevant)`);
+      if (!chats.length) out.push('No messages in this period.');
+      if (due.length) {
+        out.push('', '## Reminders due');
+        for (const n of due) out.push(`${n.due! < from ? 'OVERDUE ' : ''}${noteLine(n, true)}`);
+      }
+      if (waiting.length) out.push('', '## Waiting on the user', ...waiting.map(block));
+      if (rest.length) out.push('', '## Answered, or nothing to answer', ...rest.map(block));
+      if (older.length) {
+        out.push('', '## Still waiting from earlier days');
+        for (const r of older) out.push(`${r.name} (${displayNumber(r.jid)}) | ${r.waiting}${r.more ? '+' : ''} waiting since ${when(r.since)} | last: "${oneLine(r.last, 160)}"`);
+      }
+      return text(note + out.join('\n'));
+    },
+  );
+
   /** A chat for the media tools: a jid as shown, or a name that matches exactly one chat. */
   const oneChat = async (chat: string): Promise<{ jid: string } | { error: string }> => {
     const m = (await wa.resolveChat(chat)) as { jid: string; name: string }[];
@@ -186,6 +265,96 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
     if (m.length > 1 && !chat.includes('@')) return { error: `"${chat}" matches several chats, pass the jid:\n` + m.map((c) => `${c.name} | ${c.jid}`).join('\n') };
     return { jid: m[0].jid };
   };
+
+  /** A chat for notes: like oneChat, but a phone number that has no chat yet is fine too. */
+  const noteChat = async (chat: string): Promise<{ jid: string } | { error: string }> => {
+    const c = await oneChat(chat);
+    if (!('error' in c)) return c;
+    const jid = /^[+\d][\d\s()-]{5,}$/.test(chat.trim()) ? toJid(chat.trim(), env.DEFAULT_COUNTRY_CODE) : null;
+    return jid ? { jid } : { error: c.error.replace('Pass the jid shown with the media id.', 'Pass the jid from list_chats, or a phone number.') };
+  };
+  const remindDay = (d: string) => zoneMidnight(d.trim(), TZ);
+
+  server.registerTool(
+    'save_note',
+    {
+      description:
+        "Remember something about a customer or a follow-up, on this server: what they asked for, a promise made, a price quoted, a day to get back to them. " +
+        'Use remind_on for anything that needs doing on a certain day; daily_digest lists it from that day until it is marked done. ' +
+        "Only save what the user said or what the chat shows; don't invent. Nothing is sent to WhatsApp.",
+      inputSchema: {
+        text: z.string().min(1).max(2000).describe('The note, in the language the user uses'),
+        chat: z.string().optional().describe('The chat it is about: a jid, a name that matches one chat, or a phone number. Leave out for a general note'),
+        remind_on: z.string().optional().describe(`YYYY-MM-DD in ${TZ}: the day to be reminded`),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ text: body, chat, remind_on }) => {
+      let jid: string | null = null;
+      if (chat) {
+        const c = await noteChat(chat);
+        if ('error' in c) return { content: [{ type: 'text' as const, text: c.error }], isError: true };
+        jid = c.jid;
+      }
+      const due = remind_on ? remindDay(remind_on) : null;
+      const id = await wa.addNote(jid, body.trim(), due);
+      const name = jid ? (await wa.resolveChat(jid))[0]?.name ?? displayNumber(jid) : null;
+      return text(`Saved note #${id}${name ? ` for ${name}` : ''}${due ? `, reminder on ${dayOf(due)}` : ''}.`);
+    },
+  );
+
+  server.registerTool(
+    'list_notes',
+    {
+      description: 'Saved notes, reminders soonest first. Open ones only unless include_done. Filter by chat, or by due_by to see what needs doing by a day.',
+      inputSchema: {
+        chat: z.string().optional().describe('A jid, a name that matches one chat, or a phone number'),
+        due_by: z.string().optional().describe(`YYYY-MM-DD in ${TZ}: only notes with a reminder on or before this day`),
+        include_done: z.boolean().default(false),
+        limit: z.number().int().min(1).max(200).default(50),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ chat, due_by, include_done, limit }) => {
+      let jid: string | undefined;
+      if (chat) {
+        const c = await noteChat(chat);
+        if ('error' in c) return { content: [{ type: 'text' as const, text: c.error }], isError: true };
+        jid = c.jid;
+      }
+      const dueBy = due_by ? zoneMidnight(addDays(due_by.trim(), 1), TZ) : undefined;
+      const notes = (await wa.notes({ jid, open: !include_done, dueBy, limit })) as Note[];
+      if (!notes.length) return text(`No ${include_done ? '' : 'open '}notes${chat ? ` for ${chat}` : ''}${due_by ? ` due by ${due_by}` : ''}.`);
+      return text(notes.map((n) => `${noteLine(n, !jid)} (saved ${dayOf(n.created)})`).join('\n'));
+    },
+  );
+
+  server.registerTool(
+    'update_note',
+    {
+      description:
+        'Change a saved note by its #id: mark it done once it is handled (it then stops showing in daily_digest), change its text or reminder day, ' +
+        'or delete it. remind_on "none" clears the reminder.',
+      inputSchema: {
+        id: z.number().int().min(1),
+        done: z.boolean().optional(),
+        text: z.string().min(1).max(2000).optional(),
+        remind_on: z.string().optional().describe(`YYYY-MM-DD in ${TZ}, or "none"`),
+        delete: z.boolean().optional().describe('true removes the note for good'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    },
+    async ({ id, done, text: body, remind_on, delete: del }) => {
+      if (del) return text((await wa.deleteNote(id)) ? `Deleted note #${id}.` : `There is no note #${id}.`);
+      const due = remind_on === undefined ? undefined : remind_on.trim().toLowerCase() === 'none' ? null : remindDay(remind_on);
+      if (done === undefined && body === undefined && due === undefined) return text('Nothing to change: pass done, text, remind_on or delete.');
+      const ok = await wa.updateNote(id, { done, text: body?.trim(), due });
+      if (!ok) return text(`There is no note #${id}.`);
+      const parts = [done === true && 'marked done', done === false && 'reopened', body !== undefined && 'text changed',
+        due === null && 'reminder cleared', typeof due === 'number' && `reminder on ${dayOf(due)}`].filter(Boolean);
+      return text(`Note #${id}: ${parts.join(', ')}.`);
+    },
+  );
 
   server.registerTool(
     'get_media',

@@ -10,14 +10,18 @@
 import { getContentType, normalizeMessageContent, jidNormalizedUser } from '@whiskeysockets/baileys';
 import type { proto } from '@whiskeysockets/baileys';
 import type { Vault } from './vault.js';
-import { SearchIndex, fold, needsOf, words } from './search-index.js';
+import { SearchIndex, core, fold, needsOf, words } from './search-index.js';
 
 // What each kind of blob is bound to, so one can't be swapped for another.
-const MSG = 'm', CHAT = 'c', CONTACT = 'k', NAME = 'n', ALIAS = 'l';
+const MSG = 'm', CHAT = 'c', CONTACT = 'k', NAME = 'n', ALIAS = 'l', NOTE = 'o';
 
 interface MsgBlob { b: string; p?: string; s?: string; m?: MediaRef; t?: string } // body, push name, sender jid, media, transcript
 interface ChatRec { jid: string; name?: string | null; group: 0 | 1; push?: string; pushTs?: number }
 interface ContactRec { jid: string; name?: string | null; notify?: string | null }
+interface NoteBlob { j: string | null; t: string } // the chat it is about (if any), the text
+
+/** A note the agent saved: something to remember about a customer, maybe with a day to be reminded on. */
+export interface Note { id: number; jid: string | null; name: string | null; text: string; created: number; due: number | null; done: boolean }
 
 export type MediaKind = 'image' | 'video' | 'audio' | 'document' | 'sticker';
 /**
@@ -46,6 +50,11 @@ function createTables(sql: SqlStorage) {
     CREATE TABLE IF NOT EXISTS custom_names (cid TEXT PRIMARY KEY, data BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS alias (cid TEXT PRIMARY KEY, data BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS auth (k TEXT PRIMARY KEY, data BLOB NOT NULL);
+    CREATE TABLE IF NOT EXISTS notes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, chat TEXT, created INTEGER NOT NULL, due INTEGER,
+      done INTEGER NOT NULL DEFAULT 0, data BLOB NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS notes_chat ON notes (chat);
   `);
   createDerived(sql);
 }
@@ -274,7 +283,7 @@ export function describe(msg: proto.IWebMessageInfo): { type: string; body: stri
 /** One search term: a word, or a quoted phrase. A trailing * on a word matches any word that starts with it. */
 interface Term { tokens: string[]; prefix: boolean }
 
-/** Plain words are AND-ed; "quoted phrases" must appear in order; word* is a prefix. Every word is matched whole, case and accents aside. */
+/** Plain words are AND-ed; "quoted phrases" must appear in order; word* is a prefix. Every word is matched whole, case, accents and Arabic prefixes aside (see core). */
 export function parseQuery(q: string): Term[] {
   const out: Term[] = [];
   for (const raw of q.match(/"[^"]*"|\S+/g) ?? []) {
@@ -290,7 +299,8 @@ function hasTerm(have: string[], t: Term): boolean {
   const n = t.tokens.length;
   outer: for (let i = 0; i + n <= have.length; i++) {
     for (let j = 0; j < n; j++) {
-      const ok = j === n - 1 && t.prefix ? have[i + j].startsWith(t.tokens[j]) : have[i + j] === t.tokens[j];
+      const w = have[i + j], q = t.tokens[j];
+      const ok = j === n - 1 && t.prefix ? w.startsWith(q) || core(w).startsWith(core(q)) : core(w) === core(q);
       if (!ok) continue outer;
     }
     return true;
@@ -301,7 +311,8 @@ function hasTerm(have: string[], t: Term): boolean {
 /** Does this text satisfy every term? The cheap substring check runs first so most messages never get tokenized. */
 export function matches(text: string, terms: Term[]): boolean {
   const flat = fold(text);
-  if (!terms.every((t) => t.tokens.every((tok) => flat.includes(tok)))) return false;
+  // every match contains the query word's core (prefixes only ever come off the front), so this never rules out a hit
+  if (!terms.every((t) => t.tokens.every((tok) => flat.includes(core(tok))))) return false;
   const have = flat.match(/[\p{L}\p{N}]+/gu) ?? [];
   return terms.every((t) => hasTerm(have, t));
 }
@@ -777,6 +788,101 @@ export class Store {
       });
     }
     return out.sort((a, b) => b.last_ts - a.last_ts).slice(0, opts.limit);
+  }
+
+  /**
+   * What happened in each chat between `from` and `to`, for an end-of-day summary: every chat with a message in
+   * the window, how many came in and went out, whether the other side is still waiting at the end of the window
+   * (same rule as unanswered: my reaction counts as a reply, theirs doesn't count as a message), and the window's
+   * messages oldest first, the latest `perChat` of them. Chats still waiting come first, then the most recent.
+   * Groups, channels and broadcasts only with `groups`.
+   */
+  digest(opts: { from: number; to: number; groups: boolean; perChat: number; maxChats: number }) {
+    const s = this.snapshot();
+    const byChat = new Map<string, { id: string; ts: number; from_me: number; sender: string | null; type: string; data: ArrayBuffer }[]>();
+    const rows = this.sql.exec<{ id: string; chat: string; ts: number; from_me: number; sender: string | null; type: string; data: ArrayBuffer }>(
+      `SELECT id, chat, ts, from_me, sender, type, data FROM messages WHERE ts >= ? AND ts < ? ORDER BY ts ASC`, opts.from, opts.to,
+    );
+    for (const r of rows) {
+      let list = byChat.get(r.chat);
+      if (!list) byChat.set(r.chat, (list = []));
+      list.push(r);
+    }
+    const out: {
+      jid: string; name: string; is_group: number; incoming: number; outgoing: number; first_ts: number; last_ts: number;
+      waiting: number; waiting_since: number | null; earlier: number;
+      messages: { id: string; ts: number; sender: string; body: string; media: boolean }[];
+    }[] = [];
+    for (const [cid, list] of byChat) {
+      const rec = s.chats.get(cid);
+      if (!rec) continue;
+      const direct = !rec.group && /@(s\.whatsapp\.net|lid)$/.test(rec.jid);
+      if (!direct && !opts.groups) continue;
+      const counted = list.filter((r) => r.from_me || r.type !== 'reaction');
+      const lastMine = counted.map((r) => r.from_me).lastIndexOf(1);
+      const theirs = direct ? counted.slice(lastMine + 1) : [];
+      const shown = list.filter((r) => r.type !== 'reaction');
+      const kept = shown.slice(-opts.perChat);
+      out.push({
+        jid: rec.jid, name: this.nameOf(rec.jid, s).name, is_group: rec.group,
+        incoming: shown.filter((r) => !r.from_me).length, outgoing: shown.filter((r) => r.from_me).length,
+        first_ts: list[0].ts, last_ts: list[list.length - 1].ts,
+        waiting: theirs.length, waiting_since: theirs.length ? theirs[0].ts : null, earlier: shown.length - kept.length,
+        messages: kept.map((r) => {
+          const blob = this.vault.open<MsgBlob>(r.data, MSG);
+          return { id: r.id, ts: r.ts, sender: this.senderLabel(r, blob, s), body: blob.b, media: Boolean(blob.m) };
+        }),
+      });
+    }
+    out.sort((a, b) => Number(b.waiting > 0) - Number(a.waiting > 0) || b.last_ts - a.last_ts);
+    return { chats: out.slice(0, opts.maxChats), total: out.length };
+  }
+
+  // ----- notes -----
+  // What the agent is asked to remember: facts about a customer, promised follow-ups. Sealed like messages; the
+  // row keeps only the chat's keyed hash, when it was written, its reminder day and whether it is done.
+
+  addNote(jid: string | null, text: string, due: number | null): number {
+    this.sql.exec(
+      `INSERT INTO notes (chat, created, due, done, data) VALUES (?, ?, ?, 0, ?)`,
+      jid ? this.pj(jid) : null, Math.floor(Date.now() / 1000), due, this.vault.seal({ j: jid, t: text } satisfies NoteBlob, NOTE),
+    );
+    return this.sql.exec<{ id: number }>(`SELECT last_insert_rowid() AS id`).toArray()[0].id;
+  }
+
+  /** Notes, reminders soonest first, then undated ones newest first. `open` leaves out done ones; `dueBy` keeps only those due before it. */
+  notes(opts: { jid?: string; open: boolean; dueBy?: number; limit: number }): Note[] {
+    const where: string[] = [], args: (string | number)[] = [];
+    if (opts.jid) { where.push(`chat = ?`); args.push(this.pj(opts.jid)); }
+    if (opts.open) where.push(`done = 0`);
+    if (opts.dueBy !== undefined) { where.push(`due IS NOT NULL AND due < ?`); args.push(opts.dueBy); }
+    const s = this.snapshot();
+    return this.sql.exec<{ id: number; created: number; due: number | null; done: number; data: ArrayBuffer }>(
+      `SELECT id, created, due, done, data FROM notes ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+       ORDER BY done, due IS NULL, due, created DESC, id DESC LIMIT ?`, ...args, opts.limit,
+    ).toArray().map((r) => {
+      const b = this.vault.open<NoteBlob>(r.data, NOTE);
+      return { id: r.id, jid: b.j, name: b.j ? this.nameOf(b.j, s).name : null, text: b.t, created: r.created, due: r.due, done: Boolean(r.done) };
+    });
+  }
+
+  /** Change a note's text, reminder day (null clears it) or done state. False if there is no such note. */
+  updateNote(id: number, patch: { text?: string; due?: number | null; done?: boolean }): boolean {
+    const row = this.sql.exec<{ data: ArrayBuffer }>(`SELECT data FROM notes WHERE id = ?`, id).toArray()[0];
+    if (!row) return false;
+    if (patch.text !== undefined) {
+      const b = this.vault.open<NoteBlob>(row.data, NOTE);
+      this.sql.exec(`UPDATE notes SET data = ? WHERE id = ?`, this.vault.seal({ j: b.j, t: patch.text } satisfies NoteBlob, NOTE), id);
+    }
+    if (patch.due !== undefined) this.sql.exec(`UPDATE notes SET due = ? WHERE id = ?`, patch.due, id);
+    if (patch.done !== undefined) this.sql.exec(`UPDATE notes SET done = ? WHERE id = ?`, patch.done ? 1 : 0, id);
+    return true;
+  }
+
+  deleteNote(id: number): boolean {
+    if (!this.sql.exec(`SELECT 1 FROM notes WHERE id = ?`, id).toArray().length) return false;
+    this.sql.exec(`DELETE FROM notes WHERE id = ?`, id);
+    return true;
   }
 
   private blobOf(chat: string, id: string): { cid: string; ts: number; blob: MsgBlob } | null {
