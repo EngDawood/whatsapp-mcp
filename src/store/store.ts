@@ -7,7 +7,8 @@
  * and the real values live inside sealed blobs. Names are therefore resolved here, in memory, from a decrypted
  * snapshot of the small tables, and search decrypts and scans (see search()).
  */
-import { getContentType, normalizeMessageContent, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { jidNormalizedUser } from '@whiskeysockets/baileys';
+import { translate, type MediaKind, type MediaRef, type Quote, type ReactEvent, type MessageEvent } from '../whatsapp/translate.js';
 import type { proto } from '@whiskeysockets/baileys';
 import type { Vault } from '../account/vault.js';
 import { Names, isPlaceholder, type ChatRec, type ContactRec, type Name, type NameSources } from './names.js';
@@ -17,23 +18,12 @@ import { SearchIndex, core, fold, needsOf, words } from './search-index.js';
 const MSG = 'm', CHAT = 'c', CONTACT = 'k', NAME = 'n', ALIAS = 'l', NOTE = 'o';
 
 interface MsgBlob { b: string; p?: string; s?: string; m?: MediaRef; t?: string; q?: Quote } // body, push name, sender jid, media, transcript, quoted
-/** The message a reply quotes: its id and a short snippet of what it said. Only kept for messages stored after replies were captured. */
-interface Quote { id: string; b: string }
 interface NoteBlob { j: string | null; t: string } // the chat it is about (if any), the text
 
 /** A note the agent saved: something to remember about a customer, maybe with a day to be reminded on. */
 export interface Note { id: number; jid: string | null; name: string | null; text: string; created: number; due: number | null; done: boolean }
 
-export type MediaKind = 'image' | 'video' | 'audio' | 'document' | 'sticker';
-/**
- * What it takes to fetch a message's file later: where it is on WhatsApp's CDN and the key it is encrypted with,
- * plus the message key, which asking the phone to upload it again needs once the CDN copy has expired. Kept inside
- * the sealed message blob like everything else. The file itself is never stored.
- */
-export interface MediaRef {
-  k: MediaKind; key: string; path?: string; url?: string; mime?: string; len?: number; name?: string;
-  rk: { remoteJid: string; fromMe: boolean; participant?: string };
-}
+export type { MediaKind, MediaRef } from '../whatsapp/translate.js';
 
 const TABLES = ['messages', 'chats', 'contacts', 'custom_names', 'alias', 'auth'] as const;
 
@@ -214,76 +204,6 @@ export function migrateLegacy(sql: SqlStorage, vault: Vault, tx: <T>(fn: () => T
     for (const t of TABLES) sql.exec(`DROP TABLE IF EXISTS legacy_${t}`);
     sql.exec(`INSERT OR REPLACE INTO meta (k, v) VALUES ('schema', '2')`);
   });
-}
-
-// ---------- names ----------
-
-/** WhatsApp names chats it has no contact for after the number, sometimes masked ("+972∙∙∙∙∙∙∙20"). That is a placeholder, not a name. */
-const num = (v: unknown) => Number((v as { toNumber?: () => number })?.toNumber?.() ?? v ?? 0);
-
-type MediaContent = { mediaKey?: Uint8Array | string | null; directPath?: string | null; url?: string | null; mimetype?: string | null; fileLength?: unknown; fileName?: string | null };
-/** The download details of a media message, or nothing if WhatsApp didn't send enough to fetch it. */
-function mediaOf(k: MediaKind, c?: MediaContent | null): Omit<MediaRef, 'rk'> | undefined {
-  const key = typeof c?.mediaKey === 'string' ? c.mediaKey : c?.mediaKey?.length ? Buffer.from(c.mediaKey).toString('base64') : undefined;
-  if (!c || !key || !(c.directPath || c.url)) return undefined;
-  const ref: Omit<MediaRef, 'rk'> = { k, key };
-  if (c.directPath) ref.path = c.directPath;
-  if (c.url) ref.url = c.url;
-  if (c.mimetype) ref.mime = c.mimetype;
-  if (num(c.fileLength)) ref.len = num(c.fileLength);
-  if (c.fileName) ref.name = c.fileName;
-  return ref;
-}
-
-/** What a message says, in text. Media becomes a short label so search and reading still make sense. */
-export function describe(msg: proto.IWebMessageInfo): { type: string; body: string; media?: Omit<MediaRef, 'rk'> } | null {
-  const m = normalizeMessageContent(msg.message);
-  if (!m) return null;
-  const type = getContentType(m);
-  if (!type) return null;
-  const cap = (s?: string | null) => (s ? ` ${s}` : '');
-  switch (type) {
-    case 'conversation':
-      return { type: 'text', body: m.conversation ?? '' };
-    case 'extendedTextMessage':
-      return { type: 'text', body: m.extendedTextMessage?.text ?? '' };
-    case 'imageMessage':
-      return { type: 'image', body: `[image]${cap(m.imageMessage?.caption)}`, media: mediaOf('image', m.imageMessage) };
-    case 'videoMessage':
-      return { type: 'video', body: `[video]${cap(m.videoMessage?.caption)}`, media: mediaOf('video', m.videoMessage) };
-    case 'audioMessage': {
-      const s = num(m.audioMessage?.seconds);
-      return { type: 'audio', body: `[${m.audioMessage?.ptt ? 'voice note' : 'audio'}${s ? ` ${s}s` : ''}]`, media: mediaOf('audio', m.audioMessage) };
-    }
-    case 'documentMessage':
-      return { type: 'document', body: `[document: ${m.documentMessage?.fileName ?? 'file'}]${cap(m.documentMessage?.caption)}`, media: mediaOf('document', m.documentMessage) };
-    case 'documentWithCaptionMessage':
-      return { type: 'document', body: `[document]` };
-    case 'stickerMessage':
-      return { type: 'sticker', body: '[sticker]', media: mediaOf('sticker', m.stickerMessage) };
-    case 'locationMessage':
-    case 'liveLocationMessage':
-      return { type: 'location', body: `[location${m.locationMessage?.name ? `: ${m.locationMessage.name}` : ''}]` };
-    case 'contactMessage':
-      return { type: 'contact', body: `[contact: ${m.contactMessage?.displayName ?? ''}]` };
-    case 'pollCreationMessage':
-    case 'pollCreationMessageV2':
-    case 'pollCreationMessageV3':
-      return { type: 'poll', body: `[poll: ${(m as any)[type]?.name ?? ''}]` };
-    default:
-      return null; // reactions, protocol, key distribution and other plumbing
-  }
-}
-
-/** If this message replies to another, which one and what it said (shortened). */
-export function quoteOf(msg: proto.IWebMessageInfo): Quote | undefined {
-  const m = normalizeMessageContent(msg.message);
-  const type = m && getContentType(m);
-  const ci = type ? (m as any)[type]?.contextInfo : undefined;
-  if (!ci?.stanzaId) return undefined;
-  const said = ci.quotedMessage ? describe({ key: {}, message: ci.quotedMessage } as proto.IWebMessageInfo)?.body : undefined;
-  const flat = (said ?? '').replace(/\s+/g, ' ').trim();
-  return { id: ci.stanzaId, b: flat.length > 120 ? flat.slice(0, 120).trimEnd() + '…' : flat };
 }
 
 // ---------- search ----------
@@ -492,89 +412,21 @@ export class Store {
   ingestMessages(msgs: proto.IWebMessageInfo[]): number {
     let added = 0;
     const chatsSeen = new Map<string, { group: 0 | 1; push?: { p: string; ts: number } }>();
+    const seenChat = (chat: string) => { if (!chatsSeen.has(chat)) chatsSeen.set(chat, { group: chat.endsWith('@g.us') ? 1 : 0 }); return chatsSeen.get(chat)!; };
     // reactions wait until the batch's messages are in, so they can quote the message they react to
-    const reactions: { chat: string; r: Parameters<Store['react']>[1] }[] = [];
+    const reactions: ReactEvent[] = [];
     this.tx(() => {
       for (const msg of msgs) {
-        const key = msg.key;
-        if (!key?.id || !key.remoteJid || key.remoteJid === 'status@broadcast') continue;
-        const chat = this.norm(key.remoteJid, (key as any).remoteJidAlt);
-        if (!chat) continue;
-        const isGroupChat = chat.endsWith('@g.us');
-        const who = (k: proto.IMessageKey | null | undefined, participant?: string | null) =>
-          k?.fromMe ? null : isGroupChat ? this.norm(k?.participant ?? participant, (k as any)?.participantAlt) : chat;
-        // history sync can carry reactions on the message itself
-        for (const x of msg.reactions ?? []) {
-          reactions.push({ chat, r: { target: key.id, fromMe: !!x.key?.fromMe, senderJid: who(x.key), emoji: x.text ?? '', ts: Math.floor(num(x.senderTimestampMs) / 1000) || num(msg.messageTimestamp) } });
+        for (const ev of translate(msg, (j, alt) => this.norm(j, alt))) {
+          if (ev.kind === 'react') { reactions.push(ev); if (!ev.history) seenChat(ev.chat); continue; }
+          if (ev.kind === 'edit') { this.editBody(ev.chat, ev.id, ev.body); continue; }
+          if (ev.kind === 'delete') { this.editBody(ev.chat, ev.id, '[deleted]', 'deleted'); continue; }
+          added += this.putMessage(ev);
+          const seen = seenChat(ev.chat);
+          if (!ev.fromMe && ev.push && (seen.push?.ts ?? -1) <= ev.ts) seen.push = { p: ev.push, ts: ev.ts };
         }
-        const rm = normalizeMessageContent(msg.message)?.reactionMessage;
-        if (rm?.key?.id) {
-          reactions.push({ chat, r: { target: rm.key.id, fromMe: !!key.fromMe, senderJid: who(key, msg.participant), emoji: rm.text ?? '', ts: Math.floor(num(rm.senderTimestampMs) / 1000) || num(msg.messageTimestamp), push: msg.pushName } });
-          if (!chatsSeen.has(chat)) chatsSeen.set(chat, { group: isGroupChat ? 1 : 0 });
-          continue;
-        }
-        const proto_ = msg.message?.protocolMessage;
-        if (proto_?.key?.id) {
-          if (proto_.editedMessage) {
-            const body = proto_.editedMessage.conversation ?? proto_.editedMessage.extendedTextMessage?.text;
-            if (body) this.editBody(chat, proto_.key.id, body);
-          } else if (proto_.type === 0) {
-            this.editBody(chat, proto_.key.id, '[deleted]', 'deleted');
-          }
-          continue;
-        }
-        const d = describe(msg);
-        if (!d) continue;
-        const isGroup = chat.endsWith('@g.us');
-        const senderJid = key.fromMe
-          ? 'me'
-          : isGroup
-            ? this.norm(key.participant ?? msg.participant, (key as any).participantAlt)
-            : chat;
-        const cid = this.pj(chat);
-        const sender = senderJid === 'me' ? 'me' : senderJid ? this.pj(senderJid) : null;
-        const ts = num(msg.messageTimestamp);
-        const media: MediaRef | undefined = d.media && {
-          ...d.media,
-          rk: { remoteJid: key.remoteJid, fromMe: !!key.fromMe, ...(key.participant ? { participant: key.participant } : {}) },
-        };
-
-        const existing = this.sql.exec<{ sender: string | null; data: ArrayBuffer }>(`SELECT sender, data FROM messages WHERE chat = ? AND id = ?`, cid, key.id).toArray()[0];
-        if (!existing) {
-          const blob: MsgBlob = { b: d.body };
-          if (msg.pushName) blob.p = msg.pushName;
-          if (senderJid && senderJid !== 'me') blob.s = senderJid;
-          if (media) blob.m = media;
-          const q = quoteOf(msg);
-          if (q) blob.q = q;
-          this.sql.exec(
-            `INSERT INTO messages (id, chat, ts, from_me, sender, type, data) VALUES (?,?,?,?,?,?,?)`,
-            key.id, cid, ts, key.fromMe ? 1 : 0, sender, d.type, this.vault.seal(blob, MSG),
-          );
-          this.noteLid(senderJid, sender);
-          this.index.add(cid, ts, d.body);
-          added++;
-        } else if (existing.sender == null || msg.pushName || media) {
-          // a repeat delivery can still fill in who sent it, their push name, or (for a message stored before media
-          // was kept) how to download its file
-          const blob = this.vault.open<MsgBlob>(existing.data, MSG);
-          const fillPush = !blob.p && msg.pushName;
-          const fillSender = existing.sender == null && sender;
-          const fillMedia = !blob.m && media;
-          if (fillPush || fillSender || fillMedia) {
-            if (fillPush) blob.p = msg.pushName!;
-            if (fillMedia) blob.m = media;
-            if (fillSender && senderJid && senderJid !== 'me') blob.s = senderJid;
-            this.sql.exec(`UPDATE messages SET sender = COALESCE(sender, ?), data = ? WHERE chat = ? AND id = ?`, sender, this.vault.seal(blob, MSG), cid, key.id);
-            if (fillSender) this.noteLid(senderJid, sender);
-          }
-        }
-
-        const seen = chatsSeen.get(chat) ?? { group: isGroup ? 1 : 0 };
-        if (!key.fromMe && msg.pushName && (seen.push?.ts ?? -1) <= ts) seen.push = { p: msg.pushName, ts };
-        chatsSeen.set(chat, seen);
       }
-      for (const { chat, r } of reactions) added += this.react(chat, r);
+      for (const r of reactions) added += this.react(r.chat, r);
       // one write per chat for the batch, not one per message
       for (const [jid, seen] of chatsSeen) {
         const old = this.getChat(jid);
@@ -587,6 +439,43 @@ export class Store {
     });
     this.dirty();
     return added;
+  }
+
+  /** Store one message, or fill in what a repeat delivery knows that the stored copy doesn't. 1 if it was new. */
+  private putMessage(ev: MessageEvent): number {
+    const cid = this.pj(ev.chat);
+    const sender = ev.fromMe ? 'me' : ev.senderJid ? this.pj(ev.senderJid) : null;
+    const existing = this.sql.exec<{ sender: string | null; data: ArrayBuffer }>(`SELECT sender, data FROM messages WHERE chat = ? AND id = ?`, cid, ev.id).toArray()[0];
+    if (!existing) {
+      const blob: MsgBlob = { b: ev.body };
+      if (ev.push) blob.p = ev.push;
+      if (ev.senderJid) blob.s = ev.senderJid;
+      if (ev.media) blob.m = ev.media;
+      if (ev.quote) blob.q = ev.quote;
+      this.sql.exec(
+        `INSERT INTO messages (id, chat, ts, from_me, sender, type, data) VALUES (?,?,?,?,?,?,?)`,
+        ev.id, cid, ev.ts, ev.fromMe ? 1 : 0, sender, ev.type, this.vault.seal(blob, MSG),
+      );
+      this.noteLid(ev.senderJid, sender);
+      this.index.add(cid, ev.ts, ev.body);
+      return 1;
+    }
+    if (existing.sender == null || ev.push || ev.media) {
+      // a repeat delivery can still fill in who sent it, their push name, or (for a message stored before media
+      // was kept) how to download its file
+      const blob = this.vault.open<MsgBlob>(existing.data, MSG);
+      const fillPush = !blob.p && ev.push;
+      const fillSender = existing.sender == null && sender;
+      const fillMedia = !blob.m && ev.media;
+      if (fillPush || fillSender || fillMedia) {
+        if (fillPush) blob.p = ev.push!;
+        if (fillMedia) blob.m = ev.media;
+        if (fillSender && ev.senderJid) blob.s = ev.senderJid;
+        this.sql.exec(`UPDATE messages SET sender = COALESCE(sender, ?), data = ? WHERE chat = ? AND id = ?`, sender, this.vault.seal(blob, MSG), cid, ev.id);
+        if (fillSender) this.noteLid(ev.senderJid, sender);
+      }
+    }
+    return 0;
   }
 
   upsertContacts(contacts: { id?: string | null; lid?: string | null; phoneNumber?: string | null; name?: string | null; notify?: string | null; verifiedName?: string | null }[]) {

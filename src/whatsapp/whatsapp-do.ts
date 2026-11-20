@@ -18,7 +18,7 @@ import type { WASocket } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-generator';
 import { sqliteAuthState } from './auth-state.js';
 import { Store, hasSchema, initSchema, isLeftover, isLegacy, migrateLegacy } from '../store/store.js';
-import type { MediaKind, MediaRef } from '../store/store.js';
+import type { MediaKind, MediaRef } from './translate.js';
 import { downloadMedia } from './media.js';
 import { MAX_AUDIO_BYTES, transcribe } from './transcribe.js';
 import { Vault } from '../account/vault.js';
