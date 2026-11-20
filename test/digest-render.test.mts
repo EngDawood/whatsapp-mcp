@@ -32,6 +32,9 @@ store.ingestMessages([
 const wa: any = {
   isPaired: async () => true, pullIfStale: async () => null,
   digest: async (o: any) => store.digest(o), unanswered: async (o: any) => store.unanswered(o),
+  resolveChat: async (r: string) => store.resolveChat(r), getMessages: async (o: any) => store.getMessages(o),
+  addNote: async (j: any, t: string, d: any) => store.addNote(j, t, d), notes: async (o: any) => store.notes(o),
+  updateNote: async (id: number, p: any) => store.updateNote(id, p), deleteNote: async (id: number) => store.deleteNote(id),
 };
 const server = buildServer(wa, { } as any, 'https://example.test', TZ);
 const [a, b] = InMemoryTransport.createLinkedPair();
@@ -48,6 +51,22 @@ check('header counts chats and waiting, in the user zone', out.startsWith('# 202
 check('the waiting customer comes first, with local times', out.indexOf('### Ali') < out.indexOf('### Sara') && out.includes('WAITING on the user since 2026-11-18 09:00') && out.includes('[09:02] Ali: والتوصيل؟'));
 check('answered chats show my reply', out.includes('### Sara (+966500000002): 1 in, 1 out') && out.includes('[11:00] Me: yes, today'));
 check('a chat forgotten since an earlier day is listed', /## Still waiting from earlier days\nOmar \(\+967700000003\) \| 1 waiting since 2026-11-15 00:00/.test(out));
+
+// notes, through the tools
+const call = async (name: string, args: any) => ((await client.callTool({ name, arguments: args })) as any).content[0].text as string;
+check('notes tools are listed', ['save_note', 'list_notes', 'update_note'].every((n) => names.includes(n)));
+check('save a note with a reminder, by chat name', (await call('save_note', { chat: 'Ali', text: 'أرسل عرض السعر', remind_on: '2026-11-18' })) === 'Saved note #1 for Ali, reminder on 2026-11-18.');
+check('save a note for a number with no chat yet', /^Saved note #2 for \+966511111111\.$/.test(await call('save_note', { chat: '+966 51 111 1111', text: 'new lead from Instagram' })));
+check('save a general note with an older reminder', (await call('save_note', { text: 'renew licence', remind_on: '2026-11-16' })) === 'Saved note #3, reminder on 2026-11-16.');
+const withNotes = await call('daily_digest', { date: '2026-11-18' });
+check('digest lists reminders due, overdue marked', /## Reminders due\nOVERDUE #3 \(remind 2026-11-16\): renew licence\n#1 Ali \(remind 2026-11-18\): أرسل عرض السعر/.test(withNotes));
+check('digest shows a chat\'s open notes under it', withNotes.includes('### Ali (+966500000001): 2 in, 0 out') && withNotes.includes('Note #1 (remind 2026-11-18): أرسل عرض السعر'));
+check('get_messages shows the chat\'s notes', (await call('get_messages', { chat: 'Ali' })).includes('Notes: #1 (remind 2026-11-18): أرسل عرض السعر'));
+check('list_notes by day', (await call('list_notes', { due_by: '2026-11-17' })).startsWith('#3 (remind 2026-11-16): renew licence'));
+check('mark done', (await call('update_note', { id: 1, done: true })) === 'Note #1: marked done.');
+check('a done note leaves the digest', !(await call('daily_digest', { date: '2026-11-18' })).includes('#1 '));
+check('clear a reminder, then delete', (await call('update_note', { id: 3, remind_on: 'none' })) === 'Note #3: reminder cleared.' && (await call('update_note', { id: 3, delete: true })) === 'Deleted note #3.');
+check('a missing note says so', (await call('update_note', { id: 42, done: true })) === 'There is no note #42.');
 await client.close();
 console.log(failed ? `\n${failed} FAILED` : '\nall passed');
 process.exit(failed ? 1 : 0);

@@ -549,6 +549,28 @@ for (const [i, cc, want] of cases) check(`toJid(${JSON.stringify(i)}, ${cc})`, t
   check('an old index is rebuilt and finds the new matches', fresh.search({ queries: ['طلب'], limit: 5 }).hits[0].length === 1 && (osql.exec(`SELECT v FROM meta WHERE k = 'search_index'`).toArray()[0] as any).v === '2');
 }
 
+// ---------- notes ----------
+{
+  const { sql: nsql } = makeSql();
+  initSchema(nsql);
+  const ns = new Store(nsql, (fn) => fn(), vault);
+  const ALI = '966500000001@s.whatsapp.net';
+  ns.ingestMessages([M('n1', ALI, 10, 'hi', false, { pushName: 'Ali' })]);
+  const a = ns.addNote(ALI, 'يريد ٣ قطع، أرسل له السعر', 5000);
+  const b = ns.addNote(null, 'renew the shop licence', null);
+  const c = ns.addNote(ALI, 'prefers delivery after 5pm', null);
+  check('notes get increasing ids', a === 1 && b === 2 && c === 3, [a, b, c]);
+  check('note text is sealed, not stored in the clear', !(nsql.exec(`SELECT data FROM notes`).toArray() as any[]).some((r) => Buffer.from(r.data).includes(Buffer.from('renew'))));
+  const all = ns.notes({ open: true, limit: 10 });
+  check('reminders first, then newest', all.map((n) => n.id).join(',') === '1,3,2' && all[0].name === 'Ali' && all[0].due === 5000 && all[2].jid === null, all);
+  check('by chat', ns.notes({ jid: ALI, open: true, limit: 10 }).map((n) => n.id).join(',') === '1,3');
+  check('due by a time', ns.notes({ open: true, dueBy: 5001, limit: 10 }).map((n) => n.id).join(',') === '1' && ns.notes({ open: true, dueBy: 5000, limit: 10 }).length === 0);
+  check('marking done hides it from open notes', ns.updateNote(1, { done: true }) && ns.notes({ open: true, limit: 10 }).every((n) => n.id !== 1) && ns.notes({ open: false, limit: 10 }).find((n) => n.id === 1)?.done === true);
+  check('text and reminder change, chat stays', ns.updateNote(3, { text: 'after 6pm', due: 9000 }) && (() => { const n = ns.notes({ jid: ALI, open: true, limit: 5 })[0]; return n.id === 3 && n.text === 'after 6pm' && n.due === 9000 && n.jid === ALI; })());
+  check('a reminder can be cleared', ns.updateNote(3, { due: null }) && ns.notes({ open: true, limit: 5 }).find((n) => n.id === 3)?.due === null);
+  check('delete removes it, and a missing id says so', ns.deleteNote(2) && !ns.deleteNote(2) && !ns.updateNote(99, { done: true }) && ns.notes({ open: false, limit: 10 }).length === 2);
+}
+
 // ---------- daily digest ----------
 {
   const { sql: dsql } = makeSql();

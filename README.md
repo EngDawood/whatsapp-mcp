@@ -185,7 +185,10 @@ The risk to weigh: every linked device connects from Cloudflare's datacenter add
 | `get_messages` | Read one chat. Page back or forward by date. |
 | `search_messages` | Search across everything, or within one chat. Takes a list of queries and answers them in one pass. |
 | `unanswered_chats` | Direct chats where the other person wrote last and you haven't replied. |
-| `daily_digest` | One day (or up to 7) in one call, for an end-of-day summary: per chat, messages in and out, who is still waiting on a reply and since when, and chats still waiting from earlier days. Days follow `TIMEZONE`. |
+| `daily_digest` | One day (or up to 7) in one call, for an end-of-day summary: reminders due, per chat messages in and out and open notes, who is still waiting on a reply and since when, and chats still waiting from earlier days. Days follow `TIMEZONE`. |
+| `save_note` | Remember something about a customer or a follow-up, optionally with a day to be reminded (`remind_on`). Stored encrypted, like messages. Nothing goes to WhatsApp. |
+| `list_notes` | Saved notes, reminders soonest first; filter by chat or by day due. |
+| `update_note` | Mark a note done, change its text or reminder day, or delete it. |
 | `get_media` | Fetch the photo, voice note, video or document behind a message. |
 | `transcribe_audio` | Voice notes to text, kept with the message. Only with a Workers AI binding. |
 | `unnamed_chats` | Chats known only by phone number, busiest first, with the last thing the other person said. |

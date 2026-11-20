@@ -13,11 +13,15 @@ import type { Vault } from './vault.js';
 import { SearchIndex, core, fold, needsOf, words } from './search-index.js';
 
 // What each kind of blob is bound to, so one can't be swapped for another.
-const MSG = 'm', CHAT = 'c', CONTACT = 'k', NAME = 'n', ALIAS = 'l';
+const MSG = 'm', CHAT = 'c', CONTACT = 'k', NAME = 'n', ALIAS = 'l', NOTE = 'o';
 
 interface MsgBlob { b: string; p?: string; s?: string; m?: MediaRef; t?: string } // body, push name, sender jid, media, transcript
 interface ChatRec { jid: string; name?: string | null; group: 0 | 1; push?: string; pushTs?: number }
 interface ContactRec { jid: string; name?: string | null; notify?: string | null }
+interface NoteBlob { j: string | null; t: string } // the chat it is about (if any), the text
+
+/** A note the agent saved: something to remember about a customer, maybe with a day to be reminded on. */
+export interface Note { id: number; jid: string | null; name: string | null; text: string; created: number; due: number | null; done: boolean }
 
 export type MediaKind = 'image' | 'video' | 'audio' | 'document' | 'sticker';
 /**
@@ -46,6 +50,11 @@ function createTables(sql: SqlStorage) {
     CREATE TABLE IF NOT EXISTS custom_names (cid TEXT PRIMARY KEY, data BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS alias (cid TEXT PRIMARY KEY, data BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS auth (k TEXT PRIMARY KEY, data BLOB NOT NULL);
+    CREATE TABLE IF NOT EXISTS notes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, chat TEXT, created INTEGER NOT NULL, due INTEGER,
+      done INTEGER NOT NULL DEFAULT 0, data BLOB NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS notes_chat ON notes (chat);
   `);
   createDerived(sql);
 }
@@ -827,6 +836,53 @@ export class Store {
     }
     out.sort((a, b) => Number(b.waiting > 0) - Number(a.waiting > 0) || b.last_ts - a.last_ts);
     return { chats: out.slice(0, opts.maxChats), total: out.length };
+  }
+
+  // ----- notes -----
+  // What the agent is asked to remember: facts about a customer, promised follow-ups. Sealed like messages; the
+  // row keeps only the chat's keyed hash, when it was written, its reminder day and whether it is done.
+
+  addNote(jid: string | null, text: string, due: number | null): number {
+    this.sql.exec(
+      `INSERT INTO notes (chat, created, due, done, data) VALUES (?, ?, ?, 0, ?)`,
+      jid ? this.pj(jid) : null, Math.floor(Date.now() / 1000), due, this.vault.seal({ j: jid, t: text } satisfies NoteBlob, NOTE),
+    );
+    return this.sql.exec<{ id: number }>(`SELECT last_insert_rowid() AS id`).toArray()[0].id;
+  }
+
+  /** Notes, reminders soonest first, then undated ones newest first. `open` leaves out done ones; `dueBy` keeps only those due before it. */
+  notes(opts: { jid?: string; open: boolean; dueBy?: number; limit: number }): Note[] {
+    const where: string[] = [], args: (string | number)[] = [];
+    if (opts.jid) { where.push(`chat = ?`); args.push(this.pj(opts.jid)); }
+    if (opts.open) where.push(`done = 0`);
+    if (opts.dueBy !== undefined) { where.push(`due IS NOT NULL AND due < ?`); args.push(opts.dueBy); }
+    const s = this.snapshot();
+    return this.sql.exec<{ id: number; created: number; due: number | null; done: number; data: ArrayBuffer }>(
+      `SELECT id, created, due, done, data FROM notes ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+       ORDER BY done, due IS NULL, due, created DESC, id DESC LIMIT ?`, ...args, opts.limit,
+    ).toArray().map((r) => {
+      const b = this.vault.open<NoteBlob>(r.data, NOTE);
+      return { id: r.id, jid: b.j, name: b.j ? this.nameOf(b.j, s).name : null, text: b.t, created: r.created, due: r.due, done: Boolean(r.done) };
+    });
+  }
+
+  /** Change a note's text, reminder day (null clears it) or done state. False if there is no such note. */
+  updateNote(id: number, patch: { text?: string; due?: number | null; done?: boolean }): boolean {
+    const row = this.sql.exec<{ data: ArrayBuffer }>(`SELECT data FROM notes WHERE id = ?`, id).toArray()[0];
+    if (!row) return false;
+    if (patch.text !== undefined) {
+      const b = this.vault.open<NoteBlob>(row.data, NOTE);
+      this.sql.exec(`UPDATE notes SET data = ? WHERE id = ?`, this.vault.seal({ j: b.j, t: patch.text } satisfies NoteBlob, NOTE), id);
+    }
+    if (patch.due !== undefined) this.sql.exec(`UPDATE notes SET due = ? WHERE id = ?`, patch.due, id);
+    if (patch.done !== undefined) this.sql.exec(`UPDATE notes SET done = ? WHERE id = ?`, patch.done ? 1 : 0, id);
+    return true;
+  }
+
+  deleteNote(id: number): boolean {
+    if (!this.sql.exec(`SELECT 1 FROM notes WHERE id = ?`, id).toArray().length) return false;
+    this.sql.exec(`DELETE FROM notes WHERE id = ?`, id);
+    return true;
   }
 
   private blobOf(chat: string, id: string): { cid: string; ts: number; blob: MsgBlob } | null {
