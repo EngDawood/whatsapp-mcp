@@ -68,6 +68,11 @@
 	"limits": {
 		"cpu_ms": 300000
 	},
+	// Timestamps and "today" for daily_digest; numbers given without a country code are read as Saudi.
+	"vars": {
+		"TIMEZONE": "Asia/Riyadh",
+		"DEFAULT_COUNTRY_CODE": "966"
+	},
 	// There is no daily pull: messages are encrypted with a key that exists only while someone is signed in,
 	// so syncing happens when an agent asks (see "Things to know" in the README).
 	// Sign-in. Pick one:
