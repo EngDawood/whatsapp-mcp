@@ -488,6 +488,40 @@ for (const [i, cc, want] of cases) check(`toJid(${JSON.stringify(i)}, ${cc})`, t
   check('since leaves out quieter chats', ms.unanswered({ since: 200, limit: 10 }).length === 0);
 }
 
+
+// replies, context, activity, chat list, exact paging
+{
+  const { sql: sq } = makeSql();
+  initSchema(sq);
+  const ns = new Store(sq, (fn) => fn(), vault);
+  const A = '972501234567@s.whatsapp.net', G = '9999@g.us', P1 = '972511000001@s.whatsapp.net', P2 = '972511000002@s.whatsapp.net';
+  ns.ingestMessages([
+    M('q1', A, 1000, 'are we still on for friday?'),
+    { key: { id: 'q2', remoteJid: A, fromMe: true }, messageTimestamp: 1010, message: { extendedTextMessage: { text: 'yes!', contextInfo: { stanzaId: 'q1', quotedMessage: { conversation: 'are we still on for friday?' } } } } } as any,
+    M('q3', A, 1010, 'same second'), M('q4', A, 1020, 'great'), M('q5', A, 1030, 'see you'),
+    M('g1', G, 1005, 'one', false, { key: { participant: P1 }, pushName: 'Pa' }), M('g2', G, 1006, 'two', false, { key: { participant: P1 } }),
+    M('g3', G, 1007, 'three', false, { key: { participant: P2 }, pushName: 'Pb' }), M('g4', G, 1008, 'mine', true),
+  ]);
+  const read = ns.getMessages({ chat: A, limit: 10 });
+  const reply = read.find((m) => m.id === 'q2');
+  check('a reply remembers what it quotes', reply?.reply_to?.id === 'q1' && reply.reply_to.b === 'are we still on for friday?', reply);
+  check('messages say which are mine', reply?.from_me === 1 && read.find((m) => m.id === 'q1')?.from_me === 0);
+  const ctx = ns.context(A, 'q3', 1, 1);
+  check('context gives the neighbours, ties broken by id', JSON.stringify(ctx?.messages.map((m) => m.id)) === JSON.stringify(['q2', 'q3', 'q4']), ctx?.messages.map((m) => m.id));
+  check('context of a missing message is null', ns.context(A, 'nope', 2, 2) === null);
+  const all = ns.getMessages({ chat: A, limit: 10 }).map((m) => m.id);
+  const page1 = ns.getMessages({ chat: A, limit: 2 });
+  const page2 = ns.getMessages({ chat: A, limit: 10, before: page1[0].ts, beforeId: page1[0].id });
+  check('paging back with an id skips nothing from the same second', JSON.stringify([...page2, ...page1].map((m) => m.id)) === JSON.stringify(all), { all, p: [...page2, ...page1].map((m) => m.id) });
+  const act = ns.activity({ since: 0, until: 5000, limit: 10 });
+  check('activity counts messages per chat, busiest first', act.totals.messages === 9 && act.chats[0].jid === A && act.chats[0].messages === 5 && act.chats[0].mine === 1, act);
+  const grp = ns.activity({ since: 0, until: 5000, chat: G, limit: 10 });
+  check('activity in a chat names the people', grp.people[0].name === 'Pa' && grp.people[0].messages === 2 && grp.people.some((p) => p.me && p.messages === 1), grp.people);
+  check('activity respects the period', ns.activity({ since: 1025, until: 5000, limit: 10 }).totals.messages === 1);
+  const list = ns.chatList(undefined, 10);
+  check('the chat list carries the latest message', list[0].jid === A && list[0].last?.body === 'see you', list[0]);
+}
+
 // WhatsApp's media encryption, built the way a sender does, opened by decryptMedia
 {
   const mediaKey = crypto.getRandomValues(new Uint8Array(32));

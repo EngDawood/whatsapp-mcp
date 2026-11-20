@@ -320,6 +320,9 @@ export class WhatsAppStore extends DurableObject<Env> {
   listChats(query: string | undefined, limit: number) { return this.store.listChats(query, limit); }
   resolveChat(ref: string) { return this.store.resolveChat(ref); }
   getMessages(o: Parameters<Store['getMessages']>[0]) { return this.store.getMessages(o); }
+  context(chat: string, id: string, before: number, after: number) { return this.store.context(chat, id, before, after); }
+  activity(o: Parameters<Store['activity']>[0]) { return this.store.activity(o); }
+  chatList(query: string | undefined, limit: number) { return this.store.chatList(query, limit); }
   search(o: Parameters<Store['search']>[0]) { return this.store.search(o); }
   counts() { return this.store.counts(); }
   unnamedChats(limit: number) { return this.store.unnamedChats(limit); }

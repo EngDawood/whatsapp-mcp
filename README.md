@@ -1,5 +1,10 @@
 > **Fork note.** This is EngDawood's copy of [finereli/whatsapp-mcp](https://github.com/finereli/whatsapp-mcp) (MIT), run in single-user mode on its own Cloudflare account. Imported as a single commit from upstream `b49d494`; to bring in later upstream fixes, compare against `upstream/main` and port them. The upstream author's encrypted deploy files (`secrets/`, `CLAUDE.md`) were removed. Everything below is the upstream README.
 
+> **Additions in this fork.**
+> - **Chat viewer at `/chats`:** a read-only, WhatsApp-style view of your stored history in the browser. It has the chat list, conversations with replies, inline photos and voice notes, search across every message, and a "Waiting on me" tab. It uses the dashboard sign-in (14-day cookie), so anyone holding that browser session can read your messages. Sign out on shared machines.
+> - **New MCP tools:** `get_context` (the messages around a search hit) and `chat_activity` (who talked how much over a period, without decrypting message text).
+> - **Clearer tool output:** replies show what they quote (for messages stored from now on), search hits carry their id, and `get_messages` / `search_messages` say when more results exist and how to page to them.
+
 # whatsapp-mcp
 
 <a href="https://hackergit.org/r/finereli/whatsapp-mcp"><img src="https://hackergit.org/badge/finereli/whatsapp-mcp.svg?style=rank" alt="Hacker News" height="55"></a>

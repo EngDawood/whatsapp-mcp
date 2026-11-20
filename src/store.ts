@@ -15,7 +15,9 @@ import { SearchIndex, fold, needsOf, words } from './search-index.js';
 // What each kind of blob is bound to, so one can't be swapped for another.
 const MSG = 'm', CHAT = 'c', CONTACT = 'k', NAME = 'n', ALIAS = 'l';
 
-interface MsgBlob { b: string; p?: string; s?: string; m?: MediaRef; t?: string } // body, push name, sender jid, media, transcript
+interface MsgBlob { b: string; p?: string; s?: string; m?: MediaRef; t?: string; q?: Quote } // body, push name, sender jid, media, transcript, quoted
+/** The message a reply quotes: its id and a short snippet of what it said. Only kept for messages stored after replies were captured. */
+interface Quote { id: string; b: string }
 interface ChatRec { jid: string; name?: string | null; group: 0 | 1; push?: string; pushTs?: number }
 interface ContactRec { jid: string; name?: string | null; notify?: string | null }
 
@@ -268,6 +270,17 @@ export function describe(msg: proto.IWebMessageInfo): { type: string; body: stri
   }
 }
 
+/** If this message replies to another, which one and what it said (shortened). */
+export function quoteOf(msg: proto.IWebMessageInfo): Quote | undefined {
+  const m = normalizeMessageContent(msg.message);
+  const type = m && getContentType(m);
+  const ci = type ? (m as any)[type]?.contextInfo : undefined;
+  if (!ci?.stanzaId) return undefined;
+  const said = ci.quotedMessage ? describe({ key: {}, message: ci.quotedMessage } as proto.IWebMessageInfo)?.body : undefined;
+  const flat = (said ?? '').replace(/\s+/g, ' ').trim();
+  return { id: ci.stanzaId, b: flat.length > 120 ? flat.slice(0, 120).trimEnd() + '…' : flat };
+}
+
 // ---------- search ----------
 
 
@@ -307,6 +320,20 @@ export function matches(text: string, terms: Term[]): boolean {
 }
 
 const transcriptSuffix = (t: string) => ` transcript: ${t}`;
+
+const MSG_COLS = 'id, ts, from_me, sender, type, data';
+type MsgRow = { id: string; ts: number; from_me: number; sender: string | null; type: string; data: ArrayBuffer };
+/** A message as the tools and the web page see it. */
+export interface Msg {
+  id: string; ts: number; from_me: number; sender: string; type: string; body: string; media: boolean;
+  media_kind?: MediaKind; file_name?: string; reply_to?: Quote;
+}
+
+export interface Activity {
+  totals: { messages: number; mine: number; chats: number };
+  chats: { jid: string; name: string; is_group: number; messages: number; mine: number; first_ts: number; last_ts: number }[];
+  people: { name: string; me: boolean; messages: number; last_ts: number }[];
+}
 
 export interface SearchHit { id: string; chat: string; chat_name: string; ts: number; sender: string; body: string; media: boolean }
 
@@ -517,6 +544,8 @@ export class Store {
           if (msg.pushName) blob.p = msg.pushName;
           if (senderJid && senderJid !== 'me') blob.s = senderJid;
           if (media) blob.m = media;
+          const q = quoteOf(msg);
+          if (q) blob.q = q;
           this.sql.exec(
             `INSERT INTO messages (id, chat, ts, from_me, sender, type, data) VALUES (?,?,?,?,?,?,?)`,
             key.id, cid, ts, key.fromMe ? 1 : 0, sender, d.type, this.vault.seal(blob, MSG),
@@ -681,25 +710,101 @@ export class Store {
       .map(({ jid, name, is_group, messages, last_ts }) => ({ jid, name, is_group, messages, last_ts }));
   }
 
-  getMessages(opts: { chat: string; before?: number; after?: number; limit: number; newestFirst?: boolean }) {
+  /** One stored row as callers see it. */
+  private toMsg(r: MsgRow, s: Snapshot): Msg {
+    const blob = this.vault.open<MsgBlob>(r.data, MSG);
+    const out: Msg = { id: r.id, ts: r.ts, from_me: r.from_me, sender: this.senderLabel(r, blob, s), type: r.type, body: blob.b, media: Boolean(blob.m) };
+    if (blob.m) { out.media_kind = blob.m.k; if (blob.m.name) out.file_name = blob.m.name; }
+    if (blob.q) out.reply_to = blob.q;
+    return out;
+  }
+
+  /** `beforeId` with `before` pages back exactly: messages older than that one, even ones from the same second. */
+  getMessages(opts: { chat: string; before?: number; beforeId?: string; after?: number; limit: number; newestFirst?: boolean }): Msg[] {
     const where = [`chat = ?`];
     const args: (string | number)[] = [this.pj(opts.chat)];
-    if (opts.before) { where.push(`ts < ?`); args.push(opts.before); }
+    if (opts.before && opts.beforeId) { where.push(`(ts < ? OR (ts = ? AND id < ?))`); args.push(opts.before, opts.before, opts.beforeId); }
+    else if (opts.before) { where.push(`ts < ?`); args.push(opts.before); }
     if (opts.after) { where.push(`ts > ?`); args.push(opts.after); }
     // newest N, shown oldest-first, unless an `after` cursor asks to page forward
     const order = opts.after && !opts.before ? 'ASC' : 'DESC';
     const s = this.snapshot();
     const rows = this.sql
-      .exec<{ id: string; ts: number; from_me: number; sender: string | null; type: string; data: ArrayBuffer }>(
-        `SELECT id, ts, from_me, sender, type, data FROM messages WHERE ${where.join(' AND ')} ORDER BY ts ${order} LIMIT ?`,
-        ...args, opts.limit,
-      )
+      .exec<MsgRow>(`SELECT ${MSG_COLS} FROM messages WHERE ${where.join(' AND ')} ORDER BY ts ${order}, id ${order} LIMIT ?`, ...args, opts.limit)
       .toArray()
-      .map((r) => {
-        const blob = this.vault.open<MsgBlob>(r.data, MSG);
-        return { id: r.id, ts: r.ts, sender: this.senderLabel(r, blob, s), type: r.type, body: blob.b, media: Boolean(blob.m) };
-      });
+      .map((r) => this.toMsg(r, s));
     return order === 'DESC' ? rows.reverse() : rows;
+  }
+
+  /**
+   * The messages around one message: up to `before` earlier and `after` later, oldest first, with the message itself
+   * marked. Ties on the timestamp are broken by id so nothing shows twice. Null if the message isn't in that chat.
+   */
+  context(chat: string, id: string, before: number, after: number): { target: string; messages: Msg[] } | null {
+    const cid = this.pj(chat);
+    const t = this.sql.exec<MsgRow>(`SELECT ${MSG_COLS} FROM messages WHERE chat = ? AND id = ?`, cid, id).toArray()[0];
+    if (!t) return null;
+    const s = this.snapshot();
+    const earlier = before ? this.sql.exec<MsgRow>(
+      `SELECT ${MSG_COLS} FROM messages WHERE chat = ? AND (ts < ? OR (ts = ? AND id < ?)) ORDER BY ts DESC, id DESC LIMIT ?`, cid, t.ts, t.ts, id, before,
+    ).toArray().reverse() : [];
+    const later = after ? this.sql.exec<MsgRow>(
+      `SELECT ${MSG_COLS} FROM messages WHERE chat = ? AND (ts > ? OR (ts = ? AND id > ?)) ORDER BY ts ASC, id ASC LIMIT ?`, cid, t.ts, t.ts, id, after,
+    ).toArray() : [];
+    return { target: id, messages: [...earlier, t, ...later].map((r) => this.toMsg(r, s)) };
+  }
+
+  /**
+   * Who talked and how much, between two times. Counts only, from columns that are stored in the clear, so nothing is
+   * decrypted except one message per sender to name them. Reactions are left out of the counts.
+   * Without `chat`: the busiest chats. With `chat`: the busiest people in it.
+   */
+  activity(opts: { since: number; until: number; chat?: string; limit: number }): Activity {
+    const s = this.snapshot();
+    const range = [opts.since, opts.until] as const;
+    const tot = this.sql.exec<{ n: number; mine: number; chats: number }>(
+      `SELECT COUNT(*) n, COALESCE(SUM(from_me), 0) mine, COUNT(DISTINCT chat) chats FROM messages WHERE ts >= ? AND ts <= ? AND type != 'reaction'${opts.chat ? ' AND chat = ?' : ''}`,
+      ...range, ...(opts.chat ? [this.pj(opts.chat)] : []),
+    ).toArray()[0];
+    const totals = { messages: tot.n, mine: tot.mine, chats: tot.chats };
+    if (!opts.chat) {
+      const jidOf = new Map<string, ChatRec>();
+      for (const [cid, rec] of s.chats) jidOf.set(cid, rec);
+      const rows = this.sql.exec<{ chat: string; n: number; mine: number; first: number; last: number }>(
+        `SELECT chat, COUNT(*) n, SUM(from_me) mine, MIN(ts) first, MAX(ts) last FROM messages WHERE ts >= ? AND ts <= ? AND type != 'reaction' GROUP BY chat ORDER BY n DESC LIMIT ?`,
+        ...range, opts.limit,
+      ).toArray();
+      const chats = rows.flatMap((r) => {
+        const rec = jidOf.get(r.chat);
+        return rec ? [{ jid: rec.jid, name: this.nameOf(rec.jid, s).name, is_group: rec.group, messages: r.n, mine: r.mine, first_ts: r.first, last_ts: r.last }] : [];
+      });
+      return { totals, chats, people: [] };
+    }
+    const cid = this.pj(opts.chat);
+    const rows = this.sql.exec<{ sender: string | null; from_me: number; n: number; last: number }>(
+      `SELECT sender, from_me, COUNT(*) n, MAX(ts) last FROM messages WHERE chat = ? AND ts >= ? AND ts <= ? AND type != 'reaction' GROUP BY sender, from_me ORDER BY n DESC LIMIT ?`,
+      cid, ...range, opts.limit,
+    ).toArray();
+    const people = rows.map((r) => {
+      if (r.from_me) return { name: 'Me', me: true, messages: r.n, last_ts: r.last };
+      // not every message carries the sender's display name, so look at a few of their latest for one that does
+      const labels = this.sql.exec<MsgRow>(
+        `SELECT ${MSG_COLS} FROM messages WHERE chat = ? AND from_me = 0 AND sender IS ? ORDER BY ts DESC LIMIT 10`, cid, r.sender,
+      ).toArray().map((one) => this.senderLabel(one, this.vault.open<MsgBlob>(one.data, MSG), s));
+      const name = labels.find((l) => !l.startsWith('+') && l !== 'unknown') ?? labels[0] ?? 'unknown';
+      return { name, me: false, messages: r.n, last_ts: r.last };
+    });
+    return { totals, chats: [], people };
+  }
+
+  /** The chat list with the latest message of each, for a screen that shows chats the way WhatsApp does. */
+  chatList(query: string | undefined, limit: number) {
+    const s = this.snapshot();
+    return this.listChats(query, limit).map((c) => {
+      const r = this.sql.exec<MsgRow>(`SELECT ${MSG_COLS} FROM messages WHERE chat = ? ORDER BY ts DESC, id DESC LIMIT 1`, this.pj(c.jid)).toArray()[0];
+      const last = r ? this.toMsg(r, s) : null;
+      return { ...c, last: last && { body: last.body, sender: last.sender, from_me: last.from_me, type: last.type } };
+    });
   }
 
   /**

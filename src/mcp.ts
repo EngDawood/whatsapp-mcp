@@ -6,6 +6,7 @@ import type { Env, McpProps } from './index.js';
 import type { WhatsAppStore } from './whatsapp-do.js';
 import { unlockedStub } from './auth.js';
 import { toJid } from './phone.js';
+import type { Activity } from './store.js';
 
 const STALE_MS = 10 * 60_000;
 
@@ -33,6 +34,11 @@ type Rows = Record<string, any>[];
 
 /** Messages with a file carry their id, which get_media and transcribe_audio take. */
 const mediaTag = (r: Record<string, any>, chat?: string) => (r.media ? ` (media id: ${r.id}${chat ? ` in ${chat}` : ''})` : '');
+/** Every search hit carries its id, so get_context can open the conversation around it. */
+const hitTag = (r: Record<string, any>, chat: string) => (r.media ? mediaTag(r, chat) : ` (id: ${r.id} in ${chat})`);
+/** "(replying to ...)" for a message that quotes another, so an agent can follow a thread. */
+const replyTag = (r: Record<string, any>) => (r.reply_to ? ` (replying to "${r.reply_to.b || 'a message'}")` : '');
+const iso = (ts: number) => new Date(ts * 1000).toISOString();
 const TEXTUAL = /^(text\/|application\/(json|xml|csv)\b)/;
 
 const displayNumber = (jid: string) => (jid.endsWith('@s.whatsapp.net') ? `+${jid.replace('@s.whatsapp.net', '')}` : jid);
@@ -42,12 +48,13 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
   const fmt = new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle: 'short', timeStyle: 'short' });
   const when = (ts: number) => fmt.format(new Date(ts * 1000));
   const server = new McpServer(
-    { name: 'whatsapp-mcp', version: '0.0.1' },
+    { name: 'whatsapp-mcp', version: '0.1.0' },
     {
       instructions:
         `Access to the user's WhatsApp history. It can read and search messages and save names for phone numbers; it cannot send anything. Timestamps are ${TZ}. ` +
         `Each read first pulls anything new from WhatsApp if the store is more than a few minutes old. ` +
-        `Use list_chats to find a chat, get_messages to read it, search_messages to find things across chats, unanswered_chats for direct messages still waiting on a reply. ` +
+        `Use list_chats to find a chat, get_messages to read it, search_messages to find things across chats, get_context to read around a search hit, ` +
+        `chat_activity for who talked how much over a period, and unanswered_chats for direct messages still waiting on a reply. ` +
         `Photos, voice notes, videos, documents and stickers show as labels with a media id; get_media fetches the file` +
         `${canTranscribe ? ' and transcribe_audio turns voice notes into text' : ''}. ${NAME_HINT}`,
       maxToolInputElements: 10_000,
@@ -115,7 +122,14 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
       }
       const rows = (await wa.getMessages({ chat: matches[0].jid, limit, before: epoch(before), after: epoch(after) })) as Rows;
       const head = `# ${matches[0].name} (${rows.length} messages)\n`;
-      return text(note + head + rows.map((r) => `[${when(r.ts)}] ${r.sender}: ${r.body}${mediaTag(r)}`).join('\n'));
+      const body = rows.map((r) => `[${when(r.ts)}] ${r.sender}${replyTag(r)}: ${r.body}${mediaTag(r)}`).join('\n');
+      let more = '';
+      if (rows.length === limit) {
+        more = after && !before
+          ? `\n\n(more messages follow: pass after="${iso(rows[rows.length - 1].ts)}" to continue)`
+          : `\n\n(older messages exist: pass before="${iso(rows[0].ts)}" to page back)`;
+      }
+      return text(note + head + body + more);
     },
   );
 
@@ -126,7 +140,7 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
         'Search all messages (or one chat) for words, newest matches first. Words are matched whole, ignoring case and accents; several words must all appear; ' +
         '"quoted words" must appear together in order; a trailing * matches word starts (flight* finds flights). ' +
         'Messages are stored encrypted, so each search decrypts the history, which takes a few seconds. Put every search you need in `queries` ' +
-        'and the cost is paid once for all of them. To find everything with a person, use list_chats to get their chat. If nobody by that name exists, see unnamed_chats.',
+        'and the cost is paid once for all of them. Each hit shows its id; pass it to get_context to read the conversation around it. To find everything with a person, use list_chats to get their chat. If nobody by that name exists, see unnamed_chats.',
       inputSchema: {
         queries: z.array(z.string()).min(1).max(20).optional().describe('Several searches at once. Results come back grouped by query.'),
         query: z.string().optional().describe('One search. Same as queries with a single item.'),
@@ -147,10 +161,11 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
         chatJid = m[0].jid;
       }
       const { hits } = await wa.search({ queries: qs, chat: chatJid, since: epoch(since), until: epoch(until), limit });
-      const lines = (rows: typeof hits[number]) => rows.map((r) => `[${when(r.ts)}] ${r.chat_name} | ${r.sender}: ${clip(r.body)}${mediaTag(r, r.chat)}`).join('\n');
+      const lines = (rows: typeof hits[number]) => rows.map((r) => `[${when(r.ts)}] ${r.chat_name} | ${r.sender}: ${clip(r.body)}${hitTag(r, r.chat)}`).join('\n');
+      const capped = (n: number) => (n >= limit ? `\n(showing the newest ${limit}; there may be more. Raise limit or narrow with since/until.)` : '');
       const none = `No matches. If you were looking for something a particular person said, they may be saved only as a number. ${NAME_HINT}`;
-      if (qs.length === 1) return text(note + (hits[0].length ? lines(hits[0]) : none));
-      return text(note + qs.map((q, i) => `## ${q} (${hits[i].length} match${hits[i].length === 1 ? '' : 'es'})\n${hits[i].length ? lines(hits[i]) : 'No matches.'}`).join('\n\n'));
+      if (qs.length === 1) return text(note + (hits[0].length ? lines(hits[0]) + capped(hits[0].length) : none));
+      return text(note + qs.map((q, i) => `## ${q} (${hits[i].length} match${hits[i].length === 1 ? '' : 'es'})\n${hits[i].length ? lines(hits[i]) + capped(hits[i].length) : 'No matches.'}`).join('\n\n'));
     },
   );
 
@@ -186,6 +201,69 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
     if (m.length > 1 && !chat.includes('@')) return { error: `"${chat}" matches several chats, pass the jid:\n` + m.map((c) => `${c.name} | ${c.jid}`).join('\n') };
     return { jid: m[0].jid };
   };
+
+  server.registerTool(
+    'get_context',
+    {
+      description:
+        'Read the conversation around one message: the messages just before and after it in the same chat, oldest first, with the message itself marked >>. ' +
+        'Take `chat` and `message_id` from the "(id: ... in ...)" or "(media id: ... in ...)" shown on a search_messages hit.',
+      inputSchema: {
+        chat: z.string().describe('Chat jid, or a name that matches one chat'),
+        message_id: z.string(),
+        before: z.number().int().min(0).max(100).default(10).describe('Messages to show before it'),
+        after: z.number().int().min(0).max(100).default(10).describe('Messages to show after it'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ chat, message_id, before, after }) => {
+      const c = await oneChat(chat);
+      if ('error' in c) return text(c.error);
+      const r = await wa.context(c.jid, message_id, before, after);
+      if (!r) return text(`No message with id ${message_id} in that chat. Ids come from search_messages hits, and belong to the chat shown with them.`);
+      const name = (await wa.resolveChat(c.jid))[0]?.name ?? c.jid;
+      const lines = r.messages.map((m) => `${m.id === r.target ? '>> ' : ''}[${when(m.ts)}] ${m.sender}${replyTag(m)}: ${m.body}${mediaTag(m)}`);
+      return text(`# ${name} around ${when(r.messages.find((m) => m.id === r.target)!.ts)}\n${lines.join('\n')}`);
+    },
+  );
+
+  server.registerTool(
+    'chat_activity',
+    {
+      description:
+        'Who talked and how much over a period. Without `chat`: the busiest chats, with how many of the messages were the user\'s. ' +
+        'With `chat`: the busiest people in that chat. Counts only, so it is fast; read the messages with get_messages. ' +
+        'Good for "what did I miss this week" (find the busy chats first) or "who is most active in this group". Reactions are not counted. Default period: the last 7 days.',
+      inputSchema: {
+        since: z.string().optional().describe('ISO date/time. Default: 7 days ago'),
+        until: z.string().optional().describe('ISO date/time. Default: now'),
+        chat: z.string().optional().describe('One chat (jid or a name that matches one chat) to break down by person'),
+        limit: z.number().int().min(1).max(100).default(20),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ since, until, chat, limit }) => {
+      const note = await fresh();
+      const to = epoch(until) ?? Math.floor(Date.now() / 1000);
+      const from = epoch(since) ?? to - 7 * 86400;
+      let jid: string | undefined;
+      if (chat) {
+        const c = await oneChat(chat);
+        if ('error' in c) return text(note + c.error);
+        jid = c.jid;
+      }
+      const r = (await wa.activity({ since: from, until: to, chat: jid, limit })) as Activity;
+      const span = `${when(from)} to ${when(to)}`;
+      if (!r.totals.messages) return text(note + `No messages ${jid ? 'in that chat ' : ''}between ${span}.`);
+      const head = `${r.totals.messages} messages (${r.totals.mine} from the user)${jid ? '' : ` in ${r.totals.chats} chats`}, ${span}.`;
+      if (jid) {
+        const name = (await wa.resolveChat(jid))[0]?.name ?? jid;
+        return text(note + `# ${name}\n${head}\n` + r.people.map((p) => `${p.name} | ${p.messages} msgs | last ${when(p.last_ts)}`).join('\n'));
+      }
+      return text(note + head + '\n' + r.chats.map((c) => `${c.name}${c.is_group ? ' [group]' : ''} | ${c.messages} msgs (${c.mine} mine) | last ${when(c.last_ts)} | ${c.jid}`).join('\n'));
+    },
+  );
+
 
   server.registerTool(
     'get_media',

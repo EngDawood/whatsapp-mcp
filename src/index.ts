@@ -20,6 +20,7 @@ import { llmsTxt } from './landing.js';
 import { landingPage } from './landing.js';
 import { privacyPage } from './privacy.js';
 import { tosPage } from './tos.js';
+import { chatsPage } from './chats-page.js';
 import {
   accountStub, signupLimitOf, COOKIE_SECONDS, isSingleUser, mintSession, NOT_SET_UP, seatRegistry, serverMode, PAGE_SECONDS, peekPending, readSession, sessionCookie, SESSION_COOKIE,
   loginServiceUrl, redeemLoginCode, signIn, signInWithLogin, startSignIn, takePending, unlockedStub,
@@ -182,6 +183,16 @@ const ownerHandler = {
       return proceed(env, p, r.who);
     }
 
+    // The chat viewer, and the read-only calls behind it. Signed in with the dashboard's cookie.
+    if (path === '/chats') {
+      if (!(await readSession(env, cookieValue(request, SESSION_COOKIE)))) return Response.redirect(`${url.origin}/setup`, 302);
+      const res = html(chatsPage());
+      res.headers.set('x-frame-options', 'DENY');
+      res.headers.set('referrer-policy', 'no-referrer');
+      return res;
+    }
+    if (path.startsWith('/api/')) return chatsApi(request, env, url);
+
     if (path.startsWith('/pair/')) {
       const who = await readSession(env, bearer(request));
       if (!who) return json({ error: 'unauthorized' }, 401);
@@ -248,6 +259,75 @@ const ownerHandler = {
     return new Response('Not found', { status: 404 });
   },
 };
+
+const MEDIA_INLINE = /^(image\/(jpeg|png|webp|gif)|audio\/[\w.+-]+|video\/[\w.+-]+)$/;
+
+/** The calls behind /chats. Reads only, plus "check WhatsApp now". Every response is for the signed-in person alone. */
+async function chatsApi(request: Request, env: Env, url: URL): Promise<Response> {
+  const who = await readSession(env, cookieValue(request, SESSION_COOKIE));
+  if (!who) return json({ error: 'signed out' }, 401);
+  // the page always sends this header; a form or link on another site can't, so it can't trigger a pull
+  if (request.headers.get('x-wa') !== '1' && url.pathname !== '/api/media') return json({ error: 'missing header' }, 400);
+  const wa = await unlockedStub(env, who);
+  const arg = (k: string) => url.searchParams.get(k) ?? '';
+  const int = (k: string, def: number, max: number) => Math.max(1, Math.min(max, Number(arg(k)) || def));
+  try {
+    switch (url.pathname) {
+      case '/api/chats': {
+        const [chats, paired, lastPull] = await Promise.all([wa.chatList(arg('q') || undefined, int('limit', 1000, 5000)), wa.isPaired(), wa.lastPull()]);
+        return json({ chats, paired, lastPull });
+      }
+      case '/api/messages': {
+        if (!arg('chat')) return json({ error: 'chat is required' }, 400);
+        const limit = int('limit', 60, 300);
+        const before = Number(arg('before')) || undefined;
+        const messages = await wa.getMessages({ chat: arg('chat'), limit: limit + 1, before, beforeId: arg('beforeId') || undefined });
+        const more = messages.length > limit;
+        return json({ messages: more ? messages.slice(1) : messages, more });
+      }
+      case '/api/context': {
+        const r = await wa.context(arg('chat'), arg('id'), 30, 30);
+        return r ? json(r) : json({ error: 'no such message' }, 404);
+      }
+      case '/api/search': {
+        const q = arg('q').trim().slice(0, 200);
+        if (!q) return json({ hits: [], limit: 0 });
+        const limit = 100;
+        const { hits } = await wa.search({ queries: [q], chat: arg('chat') || undefined, limit });
+        return json({ hits: hits[0], limit });
+      }
+      case '/api/unanswered':
+        return json({ rows: await wa.unanswered({ since: Math.floor(Date.now() / 1000) - 14 * 86400, limit: 100 }) });
+      case '/api/sync': {
+        if (request.method !== 'POST') return json({ error: 'POST only' }, 405);
+        if (!(await wa.isPaired())) return json({ added: 0, paired: false });
+        const r = await wa.pullIfStale(60_000);
+        return json({ added: r?.added ?? 0, paired: true });
+      }
+      case '/api/media': {
+        const r = await wa.fetchMedia(arg('chat'), arg('id'));
+        if (!r.ok) return new Response(r.error, { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } });
+        const mime = r.mime.split(';')[0].trim().toLowerCase();
+        // a file someone sent you is not trusted: only plain pictures, audio and video show in the page, the rest downloads,
+        // and nothing served from here can run script on this origin
+        const inline = MEDIA_INLINE.test(mime) && !arg('download');
+        const name = (r.name ?? `${r.kind}`).replace(/[^\w.\- ]+/g, '_').slice(0, 120) || 'file';
+        return new Response(Buffer.from(r.data, 'base64'), {
+          headers: {
+            'content-type': inline ? mime : 'application/octet-stream',
+            'content-disposition': `${inline ? 'inline' : 'attachment'}; filename="${name}"`,
+            'content-security-policy': "default-src 'none'; sandbox",
+            'x-content-type-options': 'nosniff',
+            'cache-control': 'private, max-age=3600',
+          },
+        });
+      }
+    }
+    return json({ error: 'not found' }, 404);
+  } catch (e: any) {
+    return json({ error: e?.message ?? 'failed' }, 500);
+  }
+}
 
 const oauth = new OAuthProvider({
   apiRoute: '/mcp',
