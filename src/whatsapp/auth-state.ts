@@ -1,7 +1,7 @@
 /** Baileys auth state backed by the Durable Object's SQLite, replacing useMultiFileAuthState. Sealed with the user's Vault. */
 import { initAuthCreds, BufferJSON, proto } from '@whiskeysockets/baileys';
 import type { AuthenticationCreds, AuthenticationState, SignalDataTypeMap } from '@whiskeysockets/baileys';
-import type { Vault } from './vault.js';
+import type { Vault } from '../account/vault.js';
 
 const AAD = 'a';
 

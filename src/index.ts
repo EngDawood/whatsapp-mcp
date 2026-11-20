@@ -6,29 +6,29 @@
  * a later one just signs in. Each person's messages live in their own Durable Object, sealed with a key that
  * only their password can produce.
  */
-import './polyfills.js';
+import './platform/polyfills.js';
 import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
 import type { OAuthHelpers } from '@cloudflare/workers-oauth-provider';
-import { WhatsAppStore } from './whatsapp-do.js';
-import { handleMcp } from './mcp.js';
-import { consentPage, fullPage, loginPage, messagePage, pairPage, waitlistDonePage, waitlistErrorPage } from './pages.js';
-import { limitsOf } from './limits.js';
-import { notify } from './notify.js';
-import { xHandle } from './ui.js';
-import { APPLE_TOUCH_ICON, FAVICON_32, FAVICON_SVG, SOCIAL_CARD } from './brand.js';
-import { llmsTxt } from './landing.js';
-import { landingPage } from './landing.js';
-import { privacyPage } from './privacy.js';
-import { tosPage } from './tos.js';
-import { chatsPage } from './chats-page.js';
+import { WhatsAppStore } from './whatsapp/whatsapp-do.js';
+import { handleMcp } from './mcp/server.js';
+import { consentPage, fullPage, loginPage, messagePage, pairPage, waitlistDonePage, waitlistErrorPage } from './web/pages.js';
+import { limitsOf } from './account/limits.js';
+import { notify } from './account/notify.js';
+import { xHandle } from './web/ui.js';
+import { APPLE_TOUCH_ICON, FAVICON_32, FAVICON_SVG, SOCIAL_CARD } from './web/brand.js';
+import { llmsTxt } from './web/landing.js';
+import { landingPage } from './web/landing.js';
+import { privacyPage } from './web/privacy.js';
+import { tosPage } from './web/tos.js';
+import { chatsPage } from './web/chats-page.js';
 import {
   accountStub, signupLimitOf, COOKIE_SECONDS, isSingleUser, mintSession, NOT_SET_UP, seatRegistry, serverMode, PAGE_SECONDS, peekPending, readSession, sessionCookie, SESSION_COOKIE,
   loginServiceUrl, redeemLoginCode, signIn, signInWithLogin, startSignIn, takePending, unlockedStub,
   type AuthEnv, type Identity,
-} from './auth.js';
+} from './account/auth.js';
 
 export { WhatsAppStore };
-export { Registry } from './registry.js';
+export { Registry } from './account/registry.js';
 
 export interface Env extends AuthEnv {
   OAUTH_PROVIDER: OAuthHelpers;

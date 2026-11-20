@@ -18,7 +18,7 @@
  * word's first 1-4 letters for `word*` prefix searches. A block covers its chat from its `start` up to the next block's start, so
  * history arriving out of order still has exactly one block to go in.
  */
-import type { Vault } from './vault.js';
+import type { Vault } from '../account/vault.js';
 
 export const BLOCK = 128;      // a chat's newest block takes this many messages before a new one starts
 const SPLIT = BLOCK * 2;       // an older block that grows past this (history filling in) is rebuilt smaller

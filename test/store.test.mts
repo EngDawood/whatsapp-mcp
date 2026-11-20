@@ -1,12 +1,12 @@
 // Runs the real Store against node:sqlite (a stand-in for the Durable Object's SqlStorage).
 import { DatabaseSync } from 'node:sqlite';
-import { initSchema, isLegacy, matches, migrateLegacy, parseQuery, Store } from '../src/store.ts';
-import { core, fold } from '../src/search-index.ts';
-import { sqliteAuthState } from '../src/auth-state.ts';
-import { decryptMedia } from '../src/media.ts';
-import { limitsOf, verdict } from '../src/limits.ts';
-import { addDays, zoneMidnight, zoneToday } from '../src/zone.ts';
-import { createAccount, KDF_ITERATIONS, KEY_STRETCH, newToken, PBKDF2_PASS, openAccount, rewrap, tokenId, unwrapForToken, Vault, wrapForToken } from '../src/vault.ts';
+import { initSchema, isLegacy, matches, migrateLegacy, parseQuery, Store } from '../src/store/store.ts';
+import { core, fold } from '../src/store/search-index.ts';
+import { sqliteAuthState } from '../src/whatsapp/auth-state.ts';
+import { decryptMedia } from '../src/whatsapp/media.ts';
+import { limitsOf, verdict } from '../src/account/limits.ts';
+import { addDays, zoneMidnight, zoneToday } from '../src/history/zone.ts';
+import { createAccount, KDF_ITERATIONS, KEY_STRETCH, newToken, PBKDF2_PASS, openAccount, rewrap, tokenId, unwrapForToken, Vault, wrapForToken } from '../src/account/vault.ts';
 
 // ---------- a SqlStorage lookalike ----------
 
@@ -322,7 +322,7 @@ check('no caps never rejects', verdict({ messages: 9e9, bytes: 9e12 }, { message
 
 // ---------- phone parsing ----------
 
-const { toJid } = await import('../src/phone.ts');
+const { toJid } = await import('../src/whatsapp/phone.ts');
 const cases: [string, string | undefined, string | null][] = [
   ['+972 52-421-9320', undefined, '972524219320@s.whatsapp.net'], ['052-421-9320', '972', '972524219320@s.whatsapp.net'],
   ['052-421-9320', undefined, null], ['00972524219320', undefined, '972524219320@s.whatsapp.net'],

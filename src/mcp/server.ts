@@ -2,12 +2,12 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { z } from 'zod';
-import type { Env, McpProps } from './index.js';
-import type { WhatsAppStore } from './whatsapp-do.js';
-import { unlockedStub } from './auth.js';
-import { toJid } from './phone.js';
-import { addDays, zoneMidnight, zoneToday } from './zone.js';
-import type { Activity, Note } from './store.js';
+import type { Env, McpProps } from '../index.js';
+import type { WhatsAppStore } from '../whatsapp/whatsapp-do.js';
+import { unlockedStub } from '../account/auth.js';
+import { toJid } from '../whatsapp/phone.js';
+import { addDays, zoneMidnight, zoneToday } from '../history/zone.js';
+import type { Activity, Note } from '../store/store.js';
 
 const STALE_MS = 10 * 60_000;
 

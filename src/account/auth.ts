@@ -18,7 +18,7 @@
 import { createHash } from 'node:crypto';
 import { createAccount, KEY_STRETCH, newToken, openAccount, tokenId, unwrapForToken, wrapForToken } from './vault.js';
 import type { AccountRecord } from './vault.js';
-import type { WhatsAppStore } from './whatsapp-do.js';
+import type { WhatsAppStore } from '../whatsapp/whatsapp-do.js';
 import type { Registry } from './registry.js';
 import { serverMode } from './limits.js';
 

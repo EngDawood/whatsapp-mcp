@@ -9,7 +9,7 @@
  */
 import { getContentType, normalizeMessageContent, jidNormalizedUser } from '@whiskeysockets/baileys';
 import type { proto } from '@whiskeysockets/baileys';
-import type { Vault } from './vault.js';
+import type { Vault } from '../account/vault.js';
 import { SearchIndex, core, fold, needsOf, words } from './search-index.js';
 
 // What each kind of blob is bound to, so one can't be swapped for another.

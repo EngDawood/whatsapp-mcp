@@ -2,10 +2,10 @@
 import { DatabaseSync } from 'node:sqlite';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { initSchema, Store } from '../src/store.ts';
-import { createAccount, Vault } from '../src/vault.ts';
-import { buildServer } from '../src/mcp.ts';
-import { zoneMidnight } from '../src/zone.ts';
+import { initSchema, Store } from '../src/store/store.ts';
+import { createAccount, Vault } from '../src/account/vault.ts';
+import { buildServer } from '../src/mcp/server.ts';
+import { zoneMidnight } from '../src/history/zone.ts';
 
 const db = new DatabaseSync(':memory:');
 const fromDb = (rows: any[]) => rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v instanceof Uint8Array ? v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength) : v])));

@@ -11,21 +11,21 @@
  * connected, writes it to SQLite, and hangs up. Pairing is the same session
  * with the QR exposed and a longer leash, so the first full history sync lands.
  */
-import { liveIntervals } from './polyfills.js';
+import { liveIntervals } from '../platform/polyfills.js';
 import { DurableObject } from 'cloudflare:workers';
 import { makeWASocket, DisconnectReason } from '@whiskeysockets/baileys';
 import type { WASocket } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-generator';
 import { sqliteAuthState } from './auth-state.js';
-import { Store, hasSchema, initSchema, isLeftover, isLegacy, migrateLegacy } from './store.js';
-import type { MediaKind, MediaRef } from './store.js';
+import { Store, hasSchema, initSchema, isLeftover, isLegacy, migrateLegacy } from '../store/store.js';
+import type { MediaKind, MediaRef } from '../store/store.js';
 import { downloadMedia } from './media.js';
 import { MAX_AUDIO_BYTES, transcribe } from './transcribe.js';
-import { Vault } from './vault.js';
-import { limitsOf, verdict } from './limits.js';
-import { contactText, xHandle } from './ui.js';
-import type { AccountRecord } from './vault.js';
-import type { Env } from './index.js';
+import { Vault } from '../account/vault.js';
+import { limitsOf, verdict } from '../account/limits.js';
+import { contactText, xHandle } from '../web/ui.js';
+import type { AccountRecord } from '../account/vault.js';
+import type { Env } from '../index.js';
 
 type Phase = 'idle' | 'connecting' | 'qr' | 'syncing';
 export interface SessionResult { reason: string; added: number; ms: number }
