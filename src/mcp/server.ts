@@ -8,6 +8,7 @@ import { unlockedStub } from '../account/auth.js';
 import { toJid } from '../whatsapp/phone.js';
 import { addDays, zoneMidnight, zoneToday } from '../history/zone.js';
 import type { Activity, Note } from '../store/store.js';
+import { isPlaceholder, numberLabel } from '../store/names.js';
 
 const STALE_MS = 10 * 60_000;
 
@@ -42,7 +43,7 @@ const replyTag = (r: Record<string, any>) => (r.reply_to ? ` (replying to "${r.r
 const iso = (ts: number) => new Date(ts * 1000).toISOString();
 const TEXTUAL = /^(text\/|application\/(json|xml|csv)\b)/;
 
-const displayNumber = (jid: string) => (jid.endsWith('@s.whatsapp.net') ? `+${jid.replace('@s.whatsapp.net', '')}` : jid);
+const displayNumber = numberLabel;
 
 export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: string, TZ: string) {
   const canTranscribe = Boolean(env.AI);
@@ -536,7 +537,7 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
         const jid = raw.includes('@') ? raw : toJid(raw, env.DEFAULT_COUNTRY_CODE);
         const name = n.name.trim().slice(0, 100);
         // a number or a masked placeholder isn't a name
-        if (!jid || /∙/.test(name) || (name && /^[\d\s+-]*$/.test(name))) bad.push(raw);
+        if (!jid || (name && isPlaceholder(name))) bad.push(raw);
         else rows.push({ jid, name });
       }
       const r = rows.length ? await wa.setNames(rows) : { saved: 0, removed: 0, withChat: 0 };

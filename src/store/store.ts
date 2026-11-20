@@ -10,6 +10,7 @@
 import { getContentType, normalizeMessageContent, jidNormalizedUser } from '@whiskeysockets/baileys';
 import type { proto } from '@whiskeysockets/baileys';
 import type { Vault } from '../account/vault.js';
+import { Names, isPlaceholder, type ChatRec, type ContactRec, type Name, type NameSources } from './names.js';
 import { SearchIndex, core, fold, needsOf, words } from './search-index.js';
 
 // What each kind of blob is bound to, so one can't be swapped for another.
@@ -18,8 +19,6 @@ const MSG = 'm', CHAT = 'c', CONTACT = 'k', NAME = 'n', ALIAS = 'l', NOTE = 'o';
 interface MsgBlob { b: string; p?: string; s?: string; m?: MediaRef; t?: string; q?: Quote } // body, push name, sender jid, media, transcript, quoted
 /** The message a reply quotes: its id and a short snippet of what it said. Only kept for messages stored after replies were captured. */
 interface Quote { id: string; b: string }
-interface ChatRec { jid: string; name?: string | null; group: 0 | 1; push?: string; pushTs?: number }
-interface ContactRec { jid: string; name?: string | null; notify?: string | null }
 interface NoteBlob { j: string | null; t: string } // the chat it is about (if any), the text
 
 /** A note the agent saved: something to remember about a customer, maybe with a day to be reminded on. */
@@ -220,10 +219,7 @@ export function migrateLegacy(sql: SqlStorage, vault: Vault, tx: <T>(fn: () => T
 // ---------- names ----------
 
 /** WhatsApp names chats it has no contact for after the number, sometimes masked ("+972∙∙∙∙∙∙∙20"). That is a placeholder, not a name. */
-const isPlaceholder = (name?: string | null) => !name || /∙/.test(name) || /^[\d\s+-]*$/.test(name);
-const real = (x?: string | null) => (isPlaceholder(x) ? null : (x as string));
 const num = (v: unknown) => Number((v as { toNumber?: () => number })?.toNumber?.() ?? v ?? 0);
-const numberLabel = (jid: string) => (jid.endsWith('@s.whatsapp.net') ? `+${jid.replace('@s.whatsapp.net', '')}` : jid);
 
 type MediaContent = { mediaKey?: Uint8Array | string | null; directPath?: string | null; url?: string | null; mimetype?: string | null; fileLength?: unknown; fileName?: string | null };
 /** The download details of a media message, or nothing if WhatsApp didn't send enough to fetch it. */
@@ -350,7 +346,7 @@ export interface SearchHit { id: string; chat: string; chat_name: string; ts: nu
 
 // ---------- the store ----------
 
-interface Snapshot { chats: Map<string, ChatRec>; contacts: Map<string, ContactRec>; customs: Map<string, string> }
+type Snapshot = NameSources & { names: Names };
 
 export class Store {
   private snap: Snapshot | null = null;
@@ -375,7 +371,8 @@ export class Store {
     const all = <T>(table: string, aad: string) => new Map(this.sql.exec<{ cid: string; data: ArrayBuffer }>(`SELECT cid, data FROM ${table}`).toArray().map((r) => [r.cid, this.vault.open<T>(r.data, aad)] as const));
     const customs = new Map<string, string>();
     for (const [cid, r] of all<{ jid: string; name: string }>('custom_names', NAME)) customs.set(cid, r.name);
-    return (this.snap = { chats: all<ChatRec>('chats', CHAT), contacts: all<ContactRec>('contacts', CONTACT), customs });
+    const src = { chats: all<ChatRec>('chats', CHAT), contacts: all<ContactRec>('contacts', CONTACT), customs };
+    return (this.snap = { ...src, names: new Names(src, this.pj) });
   }
 
   private chatStats() {
@@ -395,19 +392,12 @@ export class Store {
     return (this.aliasMap = m);
   }
 
-  /** The best name we have for a chat or person, and whether it is only the number. */
-  private nameOf(jid: string, s: Snapshot): { name: string; numberOnly: boolean } {
-    const id = this.pj(jid), ch = s.chats.get(id), ct = s.contacts.get(id);
-    const name = real(ch?.name) ?? real(ct?.name) ?? s.customs.get(id) ?? real(ct?.notify) ?? ch?.push ?? null;
-    return name ? { name, numberOnly: false } : { name: numberLabel(jid), numberOnly: true };
-  }
+  private nameOf(jid: string, s: Snapshot): Name { return s.names.chat(jid); }
 
-  private senderLabel(row: { from_me: number; sender: string | null }, blob: MsgBlob, s: Snapshot): string {
-    if (row.from_me) return 'Me';
-    const ct = row.sender ? s.contacts.get(row.sender) : undefined;
-    const fallback = blob.s ? `+${blob.s.replace('@s.whatsapp.net', '').replace('@lid', '')}` : 'unknown';
-    return real(ct?.name) ?? (row.sender ? s.customs.get(row.sender) : undefined) ?? real(ct?.notify) ?? blob.p ?? fallback;
+  private senderOf(row: { from_me: number; sender: string | null }, blob: MsgBlob, s: Snapshot) {
+    return s.names.sender({ fromMe: Boolean(row.from_me), sender: row.sender, jid: blob.s, push: blob.p });
   }
+  private senderLabel(row: { from_me: number; sender: string | null }, blob: MsgBlob, s: Snapshot): string { return this.senderOf(row, blob, s).name; }
 
   // ----- writing -----
 
@@ -799,10 +789,10 @@ export class Store {
     const people = rows.map((r) => {
       if (r.from_me) return { name: 'Me', me: true, messages: r.n, last_ts: r.last };
       // not every message carries the sender's display name, so look at a few of their latest for one that does
-      const labels = this.sql.exec<MsgRow>(
+      const seen = this.sql.exec<MsgRow>(
         `SELECT ${MSG_COLS} FROM messages WHERE chat = ? AND from_me = 0 AND sender IS ? ORDER BY ts DESC LIMIT 10`, cid, r.sender,
-      ).toArray().map((one) => this.senderLabel(one, this.vault.open<MsgBlob>(one.data, MSG), s));
-      const name = labels.find((l) => !l.startsWith('+') && l !== 'unknown') ?? labels[0] ?? 'unknown';
+      ).toArray().map((one) => this.senderOf(one, this.vault.open<MsgBlob>(one.data, MSG), s));
+      const name = (seen.find((n) => !n.numberOnly) ?? seen[0])?.name ?? 'unknown';
       return { name, me: false, messages: r.n, last_ts: r.last };
     });
     return { totals, chats: [], people };
