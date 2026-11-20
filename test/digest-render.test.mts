@@ -2,10 +2,11 @@
 import { DatabaseSync } from 'node:sqlite';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { initSchema, Store } from '../src/store.ts';
-import { createAccount, Vault } from '../src/vault.ts';
-import { buildServer } from '../src/mcp.ts';
-import { zoneMidnight } from '../src/zone.ts';
+import { initSchema, Store } from '../src/store/store.ts';
+import { createAccount, Vault } from '../src/account/vault.ts';
+import { buildServer } from '../src/mcp/server.ts';
+import { History } from '../src/history/history.ts';
+import { zoneMidnight } from '../src/history/zone.ts';
 
 const db = new DatabaseSync(':memory:');
 const fromDb = (rows: any[]) => rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v instanceof Uint8Array ? v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength) : v])));
@@ -29,14 +30,9 @@ store.ingestMessages([
   M('s1', SARA, day + 10 * 3600, 'order shipped?', false, 'Sara'), M('s2', SARA, day + 11 * 3600, 'yes, today', true),
 ]);
 
-const wa: any = {
-  isPaired: async () => true, pullIfStale: async () => null,
-  digest: async (o: any) => store.digest(o), unanswered: async (o: any) => store.unanswered(o),
-  resolveChat: async (r: string) => store.resolveChat(r), getMessages: async (o: any) => store.getMessages(o),
-  addNote: async (j: any, t: string, d: any) => store.addNote(j, t, d), notes: async (o: any) => store.notes(o),
-  updateNote: async (id: number, p: any) => store.updateNote(id, p), deleteNote: async (id: number) => store.deleteNote(id),
-};
-const server = buildServer(wa, { } as any, 'https://example.test', TZ);
+const live = { isPaired: async () => true, pullIfStale: async () => null, lastPull: async () => 0 };
+const h = new History(store, live, TZ, { countryCode: '966' });
+const server = buildServer(h, store, {} as any, {} as any, 'https://example.test');
 const [a, b] = InMemoryTransport.createLinkedPair();
 await server.connect(a);
 const client = new Client({ name: 't', version: '0' });

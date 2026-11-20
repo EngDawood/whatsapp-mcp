@@ -208,6 +208,7 @@ function doneScreen(s) {
   if (!screen('done',
     '<h1>' + tickIcon + 'WhatsApp is linked</h1>' +
     '<p class="stat" id="summary"></p><p class="err" id="fullnote"></p><p class="muted" id="unnamed"></p>' +
+    '<p><a class="button" href="/chats">Open your chats</a></p>' +
     '<div class="section"><h2>Connect your agent</h2>' +
     '<p>In Claude Code, run this, then type <code>/mcp</code> and sign in:</p>' +
     '<div class="cmd"><code id="cmd"></code><button id="copy" type="button">Copy</button></div>' +

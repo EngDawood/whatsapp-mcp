@@ -7,32 +7,24 @@
  * and the real values live inside sealed blobs. Names are therefore resolved here, in memory, from a decrypted
  * snapshot of the small tables, and search decrypts and scans (see search()).
  */
-import { getContentType, normalizeMessageContent, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { RpcTarget } from 'cloudflare:workers';
+import { jidNormalizedUser } from '@whiskeysockets/baileys';
+import { translate, type MediaKind, type MediaRef, type Quote, type ReactEvent, type MessageEvent } from '../whatsapp/translate.js';
 import type { proto } from '@whiskeysockets/baileys';
-import type { Vault } from './vault.js';
+import type { Vault } from '../account/vault.js';
+import { Names, isPlaceholder, type ChatRec, type ContactRec, type Name, type NameSources } from './names.js';
 import { SearchIndex, core, fold, needsOf, words } from './search-index.js';
 
 // What each kind of blob is bound to, so one can't be swapped for another.
 const MSG = 'm', CHAT = 'c', CONTACT = 'k', NAME = 'n', ALIAS = 'l', NOTE = 'o';
 
-interface MsgBlob { b: string; p?: string; s?: string; m?: MediaRef; t?: string } // body, push name, sender jid, media, transcript
-interface ChatRec { jid: string; name?: string | null; group: 0 | 1; push?: string; pushTs?: number }
-interface ContactRec { jid: string; name?: string | null; notify?: string | null }
+interface MsgBlob { b: string; p?: string; s?: string; m?: MediaRef; t?: string; q?: Quote } // body, push name, sender jid, media, transcript, quoted
 interface NoteBlob { j: string | null; t: string } // the chat it is about (if any), the text
 
 /** A note the agent saved: something to remember about a customer, maybe with a day to be reminded on. */
 export interface Note { id: number; jid: string | null; name: string | null; text: string; created: number; due: number | null; done: boolean }
 
-export type MediaKind = 'image' | 'video' | 'audio' | 'document' | 'sticker';
-/**
- * What it takes to fetch a message's file later: where it is on WhatsApp's CDN and the key it is encrypted with,
- * plus the message key, which asking the phone to upload it again needs once the CDN copy has expired. Kept inside
- * the sealed message blob like everything else. The file itself is never stored.
- */
-export interface MediaRef {
-  k: MediaKind; key: string; path?: string; url?: string; mime?: string; len?: number; name?: string;
-  rk: { remoteJid: string; fromMe: boolean; participant?: string };
-}
+export type { MediaKind, MediaRef } from '../whatsapp/translate.js';
 
 const TABLES = ['messages', 'chats', 'contacts', 'custom_names', 'alias', 'auth'] as const;
 
@@ -215,68 +207,6 @@ export function migrateLegacy(sql: SqlStorage, vault: Vault, tx: <T>(fn: () => T
   });
 }
 
-// ---------- names ----------
-
-/** WhatsApp names chats it has no contact for after the number, sometimes masked ("+972∙∙∙∙∙∙∙20"). That is a placeholder, not a name. */
-const isPlaceholder = (name?: string | null) => !name || /∙/.test(name) || /^[\d\s+-]*$/.test(name);
-const real = (x?: string | null) => (isPlaceholder(x) ? null : (x as string));
-const num = (v: unknown) => Number((v as { toNumber?: () => number })?.toNumber?.() ?? v ?? 0);
-const numberLabel = (jid: string) => (jid.endsWith('@s.whatsapp.net') ? `+${jid.replace('@s.whatsapp.net', '')}` : jid);
-
-type MediaContent = { mediaKey?: Uint8Array | string | null; directPath?: string | null; url?: string | null; mimetype?: string | null; fileLength?: unknown; fileName?: string | null };
-/** The download details of a media message, or nothing if WhatsApp didn't send enough to fetch it. */
-function mediaOf(k: MediaKind, c?: MediaContent | null): Omit<MediaRef, 'rk'> | undefined {
-  const key = typeof c?.mediaKey === 'string' ? c.mediaKey : c?.mediaKey?.length ? Buffer.from(c.mediaKey).toString('base64') : undefined;
-  if (!c || !key || !(c.directPath || c.url)) return undefined;
-  const ref: Omit<MediaRef, 'rk'> = { k, key };
-  if (c.directPath) ref.path = c.directPath;
-  if (c.url) ref.url = c.url;
-  if (c.mimetype) ref.mime = c.mimetype;
-  if (num(c.fileLength)) ref.len = num(c.fileLength);
-  if (c.fileName) ref.name = c.fileName;
-  return ref;
-}
-
-/** What a message says, in text. Media becomes a short label so search and reading still make sense. */
-export function describe(msg: proto.IWebMessageInfo): { type: string; body: string; media?: Omit<MediaRef, 'rk'> } | null {
-  const m = normalizeMessageContent(msg.message);
-  if (!m) return null;
-  const type = getContentType(m);
-  if (!type) return null;
-  const cap = (s?: string | null) => (s ? ` ${s}` : '');
-  switch (type) {
-    case 'conversation':
-      return { type: 'text', body: m.conversation ?? '' };
-    case 'extendedTextMessage':
-      return { type: 'text', body: m.extendedTextMessage?.text ?? '' };
-    case 'imageMessage':
-      return { type: 'image', body: `[image]${cap(m.imageMessage?.caption)}`, media: mediaOf('image', m.imageMessage) };
-    case 'videoMessage':
-      return { type: 'video', body: `[video]${cap(m.videoMessage?.caption)}`, media: mediaOf('video', m.videoMessage) };
-    case 'audioMessage': {
-      const s = num(m.audioMessage?.seconds);
-      return { type: 'audio', body: `[${m.audioMessage?.ptt ? 'voice note' : 'audio'}${s ? ` ${s}s` : ''}]`, media: mediaOf('audio', m.audioMessage) };
-    }
-    case 'documentMessage':
-      return { type: 'document', body: `[document: ${m.documentMessage?.fileName ?? 'file'}]${cap(m.documentMessage?.caption)}`, media: mediaOf('document', m.documentMessage) };
-    case 'documentWithCaptionMessage':
-      return { type: 'document', body: `[document]` };
-    case 'stickerMessage':
-      return { type: 'sticker', body: '[sticker]', media: mediaOf('sticker', m.stickerMessage) };
-    case 'locationMessage':
-    case 'liveLocationMessage':
-      return { type: 'location', body: `[location${m.locationMessage?.name ? `: ${m.locationMessage.name}` : ''}]` };
-    case 'contactMessage':
-      return { type: 'contact', body: `[contact: ${m.contactMessage?.displayName ?? ''}]` };
-    case 'pollCreationMessage':
-    case 'pollCreationMessageV2':
-    case 'pollCreationMessageV3':
-      return { type: 'poll', body: `[poll: ${(m as any)[type]?.name ?? ''}]` };
-    default:
-      return null; // reactions, protocol, key distribution and other plumbing
-  }
-}
-
 // ---------- search ----------
 
 
@@ -319,13 +249,31 @@ export function matches(text: string, terms: Term[]): boolean {
 
 const transcriptSuffix = (t: string) => ` transcript: ${t}`;
 
+const MSG_COLS = 'id, ts, from_me, sender, type, data';
+type MsgRow = { id: string; ts: number; from_me: number; sender: string | null; type: string; data: ArrayBuffer };
+/** A message as the tools and the web page see it. */
+export interface Msg {
+  id: string; ts: number; from_me: number; sender: string; type: string; body: string; media: boolean;
+  media_kind?: MediaKind; file_name?: string; reply_to?: Quote;
+}
+
+export interface Activity {
+  totals: { messages: number; mine: number; chats: number };
+  chats: { jid: string; name: string; is_group: number; messages: number; mine: number; first_ts: number; last_ts: number }[];
+  people: { name: string; me: boolean; messages: number; last_ts: number }[];
+}
+
 export interface SearchHit { id: string; chat: string; chat_name: string; ts: number; sender: string; body: string; media: boolean }
 
 // ---------- the store ----------
 
-interface Snapshot { chats: Map<string, ChatRec>; contacts: Map<string, ContactRec>; customs: Map<string, string> }
+type Snapshot = NameSources & { names: Names };
 
-export class Store {
+/**
+ * The message store for one account. An RpcTarget so the Worker can query it through Account.history(); its public
+ * methods are its interface, instance fields stay private to the Durable Object.
+ */
+export class Store extends RpcTarget {
   private snap: Snapshot | null = null;
   private stats: Map<string, { n: number; last: number }> | null = null;
   private aliasMap: Map<string, string> | null = null;
@@ -333,6 +281,7 @@ export class Store {
   private index: SearchIndex;
 
   constructor(private sql: SqlStorage, private tx: <T>(fn: () => T) => T, private vault: Vault) {
+    super();
     this.index = new SearchIndex(sql, vault, (data) => vault.open<MsgBlob>(data, MSG).b);
   }
 
@@ -348,7 +297,8 @@ export class Store {
     const all = <T>(table: string, aad: string) => new Map(this.sql.exec<{ cid: string; data: ArrayBuffer }>(`SELECT cid, data FROM ${table}`).toArray().map((r) => [r.cid, this.vault.open<T>(r.data, aad)] as const));
     const customs = new Map<string, string>();
     for (const [cid, r] of all<{ jid: string; name: string }>('custom_names', NAME)) customs.set(cid, r.name);
-    return (this.snap = { chats: all<ChatRec>('chats', CHAT), contacts: all<ContactRec>('contacts', CONTACT), customs });
+    const src = { chats: all<ChatRec>('chats', CHAT), contacts: all<ContactRec>('contacts', CONTACT), customs };
+    return (this.snap = { ...src, names: new Names(src, this.pj) });
   }
 
   private chatStats() {
@@ -368,19 +318,12 @@ export class Store {
     return (this.aliasMap = m);
   }
 
-  /** The best name we have for a chat or person, and whether it is only the number. */
-  private nameOf(jid: string, s: Snapshot): { name: string; numberOnly: boolean } {
-    const id = this.pj(jid), ch = s.chats.get(id), ct = s.contacts.get(id);
-    const name = real(ch?.name) ?? real(ct?.name) ?? s.customs.get(id) ?? real(ct?.notify) ?? ch?.push ?? null;
-    return name ? { name, numberOnly: false } : { name: numberLabel(jid), numberOnly: true };
-  }
+  private nameOf(jid: string, s: Snapshot): Name { return s.names.chat(jid); }
 
-  private senderLabel(row: { from_me: number; sender: string | null }, blob: MsgBlob, s: Snapshot): string {
-    if (row.from_me) return 'Me';
-    const ct = row.sender ? s.contacts.get(row.sender) : undefined;
-    const fallback = blob.s ? `+${blob.s.replace('@s.whatsapp.net', '').replace('@lid', '')}` : 'unknown';
-    return real(ct?.name) ?? (row.sender ? s.customs.get(row.sender) : undefined) ?? real(ct?.notify) ?? blob.p ?? fallback;
+  private senderOf(row: { from_me: number; sender: string | null }, blob: MsgBlob, s: Snapshot) {
+    return s.names.sender({ fromMe: Boolean(row.from_me), sender: row.sender, jid: blob.s, push: blob.p });
   }
+  private senderLabel(row: { from_me: number; sender: string | null }, blob: MsgBlob, s: Snapshot): string { return this.senderOf(row, blob, s).name; }
 
   // ----- writing -----
 
@@ -475,87 +418,21 @@ export class Store {
   ingestMessages(msgs: proto.IWebMessageInfo[]): number {
     let added = 0;
     const chatsSeen = new Map<string, { group: 0 | 1; push?: { p: string; ts: number } }>();
+    const seenChat = (chat: string) => { if (!chatsSeen.has(chat)) chatsSeen.set(chat, { group: chat.endsWith('@g.us') ? 1 : 0 }); return chatsSeen.get(chat)!; };
     // reactions wait until the batch's messages are in, so they can quote the message they react to
-    const reactions: { chat: string; r: Parameters<Store['react']>[1] }[] = [];
+    const reactions: ReactEvent[] = [];
     this.tx(() => {
       for (const msg of msgs) {
-        const key = msg.key;
-        if (!key?.id || !key.remoteJid || key.remoteJid === 'status@broadcast') continue;
-        const chat = this.norm(key.remoteJid, (key as any).remoteJidAlt);
-        if (!chat) continue;
-        const isGroupChat = chat.endsWith('@g.us');
-        const who = (k: proto.IMessageKey | null | undefined, participant?: string | null) =>
-          k?.fromMe ? null : isGroupChat ? this.norm(k?.participant ?? participant, (k as any)?.participantAlt) : chat;
-        // history sync can carry reactions on the message itself
-        for (const x of msg.reactions ?? []) {
-          reactions.push({ chat, r: { target: key.id, fromMe: !!x.key?.fromMe, senderJid: who(x.key), emoji: x.text ?? '', ts: Math.floor(num(x.senderTimestampMs) / 1000) || num(msg.messageTimestamp) } });
+        for (const ev of translate(msg, (j, alt) => this.norm(j, alt))) {
+          if (ev.kind === 'react') { reactions.push(ev); if (!ev.history) seenChat(ev.chat); continue; }
+          if (ev.kind === 'edit') { this.editBody(ev.chat, ev.id, ev.body); continue; }
+          if (ev.kind === 'delete') { this.editBody(ev.chat, ev.id, '[deleted]', 'deleted'); continue; }
+          added += this.putMessage(ev);
+          const seen = seenChat(ev.chat);
+          if (!ev.fromMe && ev.push && (seen.push?.ts ?? -1) <= ev.ts) seen.push = { p: ev.push, ts: ev.ts };
         }
-        const rm = normalizeMessageContent(msg.message)?.reactionMessage;
-        if (rm?.key?.id) {
-          reactions.push({ chat, r: { target: rm.key.id, fromMe: !!key.fromMe, senderJid: who(key, msg.participant), emoji: rm.text ?? '', ts: Math.floor(num(rm.senderTimestampMs) / 1000) || num(msg.messageTimestamp), push: msg.pushName } });
-          if (!chatsSeen.has(chat)) chatsSeen.set(chat, { group: isGroupChat ? 1 : 0 });
-          continue;
-        }
-        const proto_ = msg.message?.protocolMessage;
-        if (proto_?.key?.id) {
-          if (proto_.editedMessage) {
-            const body = proto_.editedMessage.conversation ?? proto_.editedMessage.extendedTextMessage?.text;
-            if (body) this.editBody(chat, proto_.key.id, body);
-          } else if (proto_.type === 0) {
-            this.editBody(chat, proto_.key.id, '[deleted]', 'deleted');
-          }
-          continue;
-        }
-        const d = describe(msg);
-        if (!d) continue;
-        const isGroup = chat.endsWith('@g.us');
-        const senderJid = key.fromMe
-          ? 'me'
-          : isGroup
-            ? this.norm(key.participant ?? msg.participant, (key as any).participantAlt)
-            : chat;
-        const cid = this.pj(chat);
-        const sender = senderJid === 'me' ? 'me' : senderJid ? this.pj(senderJid) : null;
-        const ts = num(msg.messageTimestamp);
-        const media: MediaRef | undefined = d.media && {
-          ...d.media,
-          rk: { remoteJid: key.remoteJid, fromMe: !!key.fromMe, ...(key.participant ? { participant: key.participant } : {}) },
-        };
-
-        const existing = this.sql.exec<{ sender: string | null; data: ArrayBuffer }>(`SELECT sender, data FROM messages WHERE chat = ? AND id = ?`, cid, key.id).toArray()[0];
-        if (!existing) {
-          const blob: MsgBlob = { b: d.body };
-          if (msg.pushName) blob.p = msg.pushName;
-          if (senderJid && senderJid !== 'me') blob.s = senderJid;
-          if (media) blob.m = media;
-          this.sql.exec(
-            `INSERT INTO messages (id, chat, ts, from_me, sender, type, data) VALUES (?,?,?,?,?,?,?)`,
-            key.id, cid, ts, key.fromMe ? 1 : 0, sender, d.type, this.vault.seal(blob, MSG),
-          );
-          this.noteLid(senderJid, sender);
-          this.index.add(cid, ts, d.body);
-          added++;
-        } else if (existing.sender == null || msg.pushName || media) {
-          // a repeat delivery can still fill in who sent it, their push name, or (for a message stored before media
-          // was kept) how to download its file
-          const blob = this.vault.open<MsgBlob>(existing.data, MSG);
-          const fillPush = !blob.p && msg.pushName;
-          const fillSender = existing.sender == null && sender;
-          const fillMedia = !blob.m && media;
-          if (fillPush || fillSender || fillMedia) {
-            if (fillPush) blob.p = msg.pushName!;
-            if (fillMedia) blob.m = media;
-            if (fillSender && senderJid && senderJid !== 'me') blob.s = senderJid;
-            this.sql.exec(`UPDATE messages SET sender = COALESCE(sender, ?), data = ? WHERE chat = ? AND id = ?`, sender, this.vault.seal(blob, MSG), cid, key.id);
-            if (fillSender) this.noteLid(senderJid, sender);
-          }
-        }
-
-        const seen = chatsSeen.get(chat) ?? { group: isGroup ? 1 : 0 };
-        if (!key.fromMe && msg.pushName && (seen.push?.ts ?? -1) <= ts) seen.push = { p: msg.pushName, ts };
-        chatsSeen.set(chat, seen);
       }
-      for (const { chat, r } of reactions) added += this.react(chat, r);
+      for (const r of reactions) added += this.react(r.chat, r);
       // one write per chat for the batch, not one per message
       for (const [jid, seen] of chatsSeen) {
         const old = this.getChat(jid);
@@ -568,6 +445,43 @@ export class Store {
     });
     this.dirty();
     return added;
+  }
+
+  /** Store one message, or fill in what a repeat delivery knows that the stored copy doesn't. 1 if it was new. */
+  private putMessage(ev: MessageEvent): number {
+    const cid = this.pj(ev.chat);
+    const sender = ev.fromMe ? 'me' : ev.senderJid ? this.pj(ev.senderJid) : null;
+    const existing = this.sql.exec<{ sender: string | null; data: ArrayBuffer }>(`SELECT sender, data FROM messages WHERE chat = ? AND id = ?`, cid, ev.id).toArray()[0];
+    if (!existing) {
+      const blob: MsgBlob = { b: ev.body };
+      if (ev.push) blob.p = ev.push;
+      if (ev.senderJid) blob.s = ev.senderJid;
+      if (ev.media) blob.m = ev.media;
+      if (ev.quote) blob.q = ev.quote;
+      this.sql.exec(
+        `INSERT INTO messages (id, chat, ts, from_me, sender, type, data) VALUES (?,?,?,?,?,?,?)`,
+        ev.id, cid, ev.ts, ev.fromMe ? 1 : 0, sender, ev.type, this.vault.seal(blob, MSG),
+      );
+      this.noteLid(ev.senderJid, sender);
+      this.index.add(cid, ev.ts, ev.body);
+      return 1;
+    }
+    if (existing.sender == null || ev.push || ev.media) {
+      // a repeat delivery can still fill in who sent it, their push name, or (for a message stored before media
+      // was kept) how to download its file
+      const blob = this.vault.open<MsgBlob>(existing.data, MSG);
+      const fillPush = !blob.p && ev.push;
+      const fillSender = existing.sender == null && sender;
+      const fillMedia = !blob.m && ev.media;
+      if (fillPush || fillSender || fillMedia) {
+        if (fillPush) blob.p = ev.push!;
+        if (fillMedia) blob.m = ev.media;
+        if (fillSender && ev.senderJid) blob.s = ev.senderJid;
+        this.sql.exec(`UPDATE messages SET sender = COALESCE(sender, ?), data = ? WHERE chat = ? AND id = ?`, sender, this.vault.seal(blob, MSG), cid, ev.id);
+        if (fillSender) this.noteLid(ev.senderJid, sender);
+      }
+    }
+    return 0;
   }
 
   upsertContacts(contacts: { id?: string | null; lid?: string | null; phoneNumber?: string | null; name?: string | null; notify?: string | null; verifiedName?: string | null }[]) {
@@ -692,25 +606,101 @@ export class Store {
       .map(({ jid, name, is_group, messages, last_ts }) => ({ jid, name, is_group, messages, last_ts }));
   }
 
-  getMessages(opts: { chat: string; before?: number; after?: number; limit: number; newestFirst?: boolean }) {
+  /** One stored row as callers see it. */
+  private toMsg(r: MsgRow, s: Snapshot): Msg {
+    const blob = this.vault.open<MsgBlob>(r.data, MSG);
+    const out: Msg = { id: r.id, ts: r.ts, from_me: r.from_me, sender: this.senderLabel(r, blob, s), type: r.type, body: blob.b, media: Boolean(blob.m) };
+    if (blob.m) { out.media_kind = blob.m.k; if (blob.m.name) out.file_name = blob.m.name; }
+    if (blob.q) out.reply_to = blob.q;
+    return out;
+  }
+
+  /** `beforeId` with `before` pages back exactly: messages older than that one, even ones from the same second. */
+  getMessages(opts: { chat: string; before?: number; beforeId?: string; after?: number; limit: number; newestFirst?: boolean }): Msg[] {
     const where = [`chat = ?`];
     const args: (string | number)[] = [this.pj(opts.chat)];
-    if (opts.before) { where.push(`ts < ?`); args.push(opts.before); }
+    if (opts.before && opts.beforeId) { where.push(`(ts < ? OR (ts = ? AND id < ?))`); args.push(opts.before, opts.before, opts.beforeId); }
+    else if (opts.before) { where.push(`ts < ?`); args.push(opts.before); }
     if (opts.after) { where.push(`ts > ?`); args.push(opts.after); }
     // newest N, shown oldest-first, unless an `after` cursor asks to page forward
     const order = opts.after && !opts.before ? 'ASC' : 'DESC';
     const s = this.snapshot();
     const rows = this.sql
-      .exec<{ id: string; ts: number; from_me: number; sender: string | null; type: string; data: ArrayBuffer }>(
-        `SELECT id, ts, from_me, sender, type, data FROM messages WHERE ${where.join(' AND ')} ORDER BY ts ${order} LIMIT ?`,
-        ...args, opts.limit,
-      )
+      .exec<MsgRow>(`SELECT ${MSG_COLS} FROM messages WHERE ${where.join(' AND ')} ORDER BY ts ${order}, id ${order} LIMIT ?`, ...args, opts.limit)
       .toArray()
-      .map((r) => {
-        const blob = this.vault.open<MsgBlob>(r.data, MSG);
-        return { id: r.id, ts: r.ts, sender: this.senderLabel(r, blob, s), type: r.type, body: blob.b, media: Boolean(blob.m) };
-      });
+      .map((r) => this.toMsg(r, s));
     return order === 'DESC' ? rows.reverse() : rows;
+  }
+
+  /**
+   * The messages around one message: up to `before` earlier and `after` later, oldest first, with the message itself
+   * marked. Ties on the timestamp are broken by id so nothing shows twice. Null if the message isn't in that chat.
+   */
+  context(chat: string, id: string, before: number, after: number): { target: string; messages: Msg[] } | null {
+    const cid = this.pj(chat);
+    const t = this.sql.exec<MsgRow>(`SELECT ${MSG_COLS} FROM messages WHERE chat = ? AND id = ?`, cid, id).toArray()[0];
+    if (!t) return null;
+    const s = this.snapshot();
+    const earlier = before ? this.sql.exec<MsgRow>(
+      `SELECT ${MSG_COLS} FROM messages WHERE chat = ? AND (ts < ? OR (ts = ? AND id < ?)) ORDER BY ts DESC, id DESC LIMIT ?`, cid, t.ts, t.ts, id, before,
+    ).toArray().reverse() : [];
+    const later = after ? this.sql.exec<MsgRow>(
+      `SELECT ${MSG_COLS} FROM messages WHERE chat = ? AND (ts > ? OR (ts = ? AND id > ?)) ORDER BY ts ASC, id ASC LIMIT ?`, cid, t.ts, t.ts, id, after,
+    ).toArray() : [];
+    return { target: id, messages: [...earlier, t, ...later].map((r) => this.toMsg(r, s)) };
+  }
+
+  /**
+   * Who talked and how much, between two times. Counts only, from columns that are stored in the clear, so nothing is
+   * decrypted except one message per sender to name them. Reactions are left out of the counts.
+   * Without `chat`: the busiest chats. With `chat`: the busiest people in it.
+   */
+  activity(opts: { since: number; until: number; chat?: string; limit: number }): Activity {
+    const s = this.snapshot();
+    const range = [opts.since, opts.until] as const;
+    const tot = this.sql.exec<{ n: number; mine: number; chats: number }>(
+      `SELECT COUNT(*) n, COALESCE(SUM(from_me), 0) mine, COUNT(DISTINCT chat) chats FROM messages WHERE ts >= ? AND ts <= ? AND type != 'reaction'${opts.chat ? ' AND chat = ?' : ''}`,
+      ...range, ...(opts.chat ? [this.pj(opts.chat)] : []),
+    ).toArray()[0];
+    const totals = { messages: tot.n, mine: tot.mine, chats: tot.chats };
+    if (!opts.chat) {
+      const jidOf = new Map<string, ChatRec>();
+      for (const [cid, rec] of s.chats) jidOf.set(cid, rec);
+      const rows = this.sql.exec<{ chat: string; n: number; mine: number; first: number; last: number }>(
+        `SELECT chat, COUNT(*) n, SUM(from_me) mine, MIN(ts) first, MAX(ts) last FROM messages WHERE ts >= ? AND ts <= ? AND type != 'reaction' GROUP BY chat ORDER BY n DESC LIMIT ?`,
+        ...range, opts.limit,
+      ).toArray();
+      const chats = rows.flatMap((r) => {
+        const rec = jidOf.get(r.chat);
+        return rec ? [{ jid: rec.jid, name: this.nameOf(rec.jid, s).name, is_group: rec.group, messages: r.n, mine: r.mine, first_ts: r.first, last_ts: r.last }] : [];
+      });
+      return { totals, chats, people: [] };
+    }
+    const cid = this.pj(opts.chat);
+    const rows = this.sql.exec<{ sender: string | null; from_me: number; n: number; last: number }>(
+      `SELECT sender, from_me, COUNT(*) n, MAX(ts) last FROM messages WHERE chat = ? AND ts >= ? AND ts <= ? AND type != 'reaction' GROUP BY sender, from_me ORDER BY n DESC LIMIT ?`,
+      cid, ...range, opts.limit,
+    ).toArray();
+    const people = rows.map((r) => {
+      if (r.from_me) return { name: 'Me', me: true, messages: r.n, last_ts: r.last };
+      // not every message carries the sender's display name, so look at a few of their latest for one that does
+      const seen = this.sql.exec<MsgRow>(
+        `SELECT ${MSG_COLS} FROM messages WHERE chat = ? AND from_me = 0 AND sender IS ? ORDER BY ts DESC LIMIT 10`, cid, r.sender,
+      ).toArray().map((one) => this.senderOf(one, this.vault.open<MsgBlob>(one.data, MSG), s));
+      const name = (seen.find((n) => !n.numberOnly) ?? seen[0])?.name ?? 'unknown';
+      return { name, me: false, messages: r.n, last_ts: r.last };
+    });
+    return { totals, chats: [], people };
+  }
+
+  /** The chat list with the latest message of each, for a screen that shows chats the way WhatsApp does. */
+  chatList(query: string | undefined, limit: number) {
+    const s = this.snapshot();
+    return this.listChats(query, limit).map((c) => {
+      const r = this.sql.exec<MsgRow>(`SELECT ${MSG_COLS} FROM messages WHERE chat = ? ORDER BY ts DESC, id DESC LIMIT 1`, this.pj(c.jid)).toArray()[0];
+      const last = r ? this.toMsg(r, s) : null;
+      return { ...c, last: last && { body: last.body, sender: last.sender, from_me: last.from_me, type: last.type } };
+    });
   }
 
   /**

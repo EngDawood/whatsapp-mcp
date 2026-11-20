@@ -2,21 +2,15 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { z } from 'zod';
-import type { Env, McpProps } from './index.js';
-import type { WhatsAppStore } from './whatsapp-do.js';
-import { unlockedStub } from './auth.js';
-import { toJid } from './phone.js';
-import { addDays, zoneMidnight, zoneToday } from './zone.js';
-import type { Note } from './store.js';
+import type { Env, McpProps } from '../index.js';
+import type { Account } from '../whatsapp/account.js';
+import { connect } from '../history/connect.js';
+import { toJid } from '../whatsapp/phone.js';
+import { addDays, zoneMidnight, zoneToday } from '../history/zone.js';
+import { History, FRESH, type Resolution } from '../history/history.js';
+import type { Note, Store } from '../store/store.js';
+import { isPlaceholder, numberLabel } from '../store/names.js';
 
-const STALE_MS = 10 * 60_000;
-
-const epoch = (s?: string) => {
-  if (!s) return undefined;
-  const t = Date.parse(s);
-  if (Number.isNaN(t)) throw new Error(`Cannot parse date "${s}" - use ISO format like 2026-03-01`);
-  return Math.floor(t / 1000);
-};
 /** Search results are for skimming; a long broadcast shouldn't flood the context. get_messages has the full text. */
 const clip = (s: string, n = 400) => (s.length > n ? `${s.slice(0, n)}... [+${s.length - n} chars]` : s);
 const oneLine = (s: string, n: number) => clip(s.replace(/\s+/g, ' ').trim(), n);
@@ -35,11 +29,28 @@ type Rows = Record<string, any>[];
 
 /** Messages with a file carry their id, which get_media and transcribe_audio take. */
 const mediaTag = (r: Record<string, any>, chat?: string) => (r.media ? ` (media id: ${r.id}${chat ? ` in ${chat}` : ''})` : '');
+/** Every search hit carries its id, so get_context can open the conversation around it. */
+const hitTag = (r: Record<string, any>, chat: string) => (r.media ? mediaTag(r, chat) : ` (id: ${r.id} in ${chat})`);
+/** "(replying to ...)" for a message that quotes another, so an agent can follow a thread. */
+const replyTag = (r: Record<string, any>) => (r.reply_to ? ` (replying to "${r.reply_to.b || 'a message'}")` : '');
 const TEXTUAL = /^(text\/|application\/(json|xml|csv)\b)/;
 
-const displayNumber = (jid: string) => (jid.endsWith('@s.whatsapp.net') ? `+${jid.replace('@s.whatsapp.net', '')}` : jid);
+const displayNumber = numberLabel;
 
-export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: string, TZ: string) {
+type Async<T> = { [K in keyof T]: T[K] extends (...a: infer A) => infer R ? (...a: A) => R | Promise<Awaited<R>> : never };
+/** What the owner can change on this server: notes, and names for numbers. Nothing here reaches WhatsApp. */
+export type Notebook = Async<Pick<Store, 'addNote' | 'updateNote' | 'deleteNote' | 'setCustomNames'>>;
+/** The live account: media, transcripts, the link and pulls. */
+export type AccountOps = Async<Pick<Account, 'fetchMedia' | 'transcribeAudio' | 'linkInfo' | 'logout' | 'pull'>>;
+
+/** Why a chat reference didn't resolve, for an agent to act on. */
+const unresolved = (r: Exclude<Resolution, { ok: true }>, hint = 'Try list_chats.') =>
+  r.reason === 'none'
+    ? `No chat matches "${r.ref}". ${hint} ${NAME_HINT}`
+    : `"${r.ref}" matches several chats, pick one by jid:\n` + r.matches.map((m) => `${m.name} | ${m.jid}`).join('\n');
+
+export function buildServer(h: History, book: Notebook, acct: AccountOps, env: Env, origin: string) {
+  const TZ = h.tz;
   const canTranscribe = Boolean(env.AI);
   const fmt = new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle: 'short', timeStyle: 'short' });
   const when = (ts: number) => fmt.format(new Date(ts * 1000));
@@ -48,12 +59,13 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
   const noteLine = (n: Note, withChat = false) =>
     `#${n.id}${withChat && n.name ? ` ${n.name}` : ''}${n.due ? ` (remind ${dayOf(n.due)})` : ''}${n.done ? ' [done]' : ''}: ${oneLine(n.text, 400)}`;
   const server = new McpServer(
-    { name: 'whatsapp-mcp', version: '0.0.1' },
+    { name: 'whatsapp-mcp', version: '0.1.0' },
     {
       instructions:
         `Access to the user's WhatsApp history. It can read and search messages and save names for phone numbers; it cannot send anything. Timestamps are ${TZ}. ` +
         `Each read first pulls anything new from WhatsApp if the store is more than a few minutes old. ` +
-        `Use list_chats to find a chat, get_messages to read it, search_messages to find things across chats, unanswered_chats for direct messages still waiting on a reply. ` +
+        `Use list_chats to find a chat, get_messages to read it, search_messages to find things across chats, get_context to read around a search hit, ` +
+        `chat_activity for who talked how much over a period, and unanswered_chats for direct messages still waiting on a reply. ` +
         `Photos, voice notes, videos, documents and stickers show as labels with a media id; get_media fetches the file` +
         `${canTranscribe ? ' and transcribe_audio turns voice notes into text' : ''}. ` +
         `daily_digest gives a whole day in one call for an end-of-day summary. When the user tells you something worth remembering about a customer ` +
@@ -75,13 +87,14 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
 
   /** Top up from WhatsApp; never let a failed pull block reading what we already have. */
   const fresh = async (): Promise<string> => {
-    try {
-      if (!(await wa.isPaired())) return `WhatsApp is not linked yet. Open ${origin}/setup to scan the QR code.\n\n`;
-      await wa.pullIfStale(STALE_MS);
-      return '';
-    } catch (e: any) {
-      return `(could not refresh from WhatsApp: ${e?.message}; showing stored messages)\n\n`;
-    }
+    const r = await h.refresh(FRESH.read);
+    if (!r.linked) return `WhatsApp is not linked yet. Open ${origin}/setup to scan the QR code.\n\n`;
+    return r.error ? `(could not refresh from WhatsApp: ${r.error}; showing stored messages)\n\n` : '';
+  };
+  /** A chat reference to one chat, or the message explaining why not. */
+  const one = async (ref: string, o: { phone?: boolean; hint?: string } = {}): Promise<{ jid: string; name: string } | { error: string }> => {
+    const r = await h.resolve(ref, o);
+    return r.ok ? r : { error: unresolved(r, o.hint) };
   };
 
   server.registerTool(
@@ -94,7 +107,7 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
     },
     async ({ query, limit }) => {
       const note = await fresh();
-      const rows = (await wa.listChats(query, limit)) as Rows;
+      const rows = (await h.chats(query, limit)) as Rows;
       if (!rows.length) return text(note + `No chats found${query ? ` matching "${query}"` : ''}. ${query ? NAME_HINT : ''}`.trimEnd());
       return text(
         note + rows.map((r) => `${r.name}${r.is_group ? ' [group]' : ''} | ${r.messages} msgs | last ${when(r.last_ts)} | ${r.jid}`).join('\n'),
@@ -111,23 +124,21 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
       inputSchema: {
         chat: z.string(),
         limit: z.number().int().min(1).max(500).default(50),
-        before: z.string().optional().describe('ISO date/time; only messages before this'),
-        after: z.string().optional().describe('ISO date/time; only messages after this'),
+        before: z.string().optional().describe('ISO date/time, or the cursor from a previous page; only messages before this'),
+        after: z.string().optional().describe('ISO date/time, or the cursor from a previous page; only messages after this'),
       },
     },
     async ({ chat, limit, before, after }) => {
       const note = await fresh();
-      const matches = (await wa.resolveChat(chat)) as { jid: string; name: string }[];
-      if (!matches.length) return text(note + `No chat matches "${chat}". Try list_chats. ${NAME_HINT}`);
-      if (matches.length > 1 && !chat.includes('@')) {
-        return text(note + `"${chat}" matches several chats, pick one by jid:\n` + matches.map((m) => `${m.name} | ${m.jid}`).join('\n'));
-      }
-      const [rows, notes] = await Promise.all([
-        wa.getMessages({ chat: matches[0].jid, limit, before: epoch(before), after: epoch(after) }) as Promise<Rows>,
-        wa.notes({ jid: matches[0].jid, open: true, limit: 20 }) as Promise<Note[]>,
-      ]);
-      const head = `# ${matches[0].name} (${rows.length} messages)\n` + (notes.length ? `Notes: ${notes.map((n) => noteLine(n)).join(' | ')}\n` : '');
-      return text(note + head + rows.map((r) => `[${when(r.ts)}] ${r.sender}: ${r.body}${mediaTag(r)}`).join('\n'));
+      const c = await one(chat);
+      if ('error' in c) return text(note + c.error);
+      const [page, notes] = await Promise.all([h.messages(c.jid, { limit, before, after }), h.notes({ jid: c.jid, open: true, limit: 20 })]);
+      const rows = page.messages;
+      const head = `# ${c.name} (${rows.length} messages)\n` + (notes.length ? `Notes: ${notes.map((n) => noteLine(n)).join(' | ')}\n` : '');
+      const body = rows.map((r) => `[${when(r.ts)}] ${r.sender}${replyTag(r)}: ${r.body}${mediaTag(r)}`).join('\n');
+      const more = page.older ? `\n\n(older messages exist: pass before="${page.older}" to page back)`
+        : page.newer ? `\n\n(more messages follow: pass after="${page.newer}" to continue)` : '';
+      return text(note + head + body + more);
     },
   );
 
@@ -138,7 +149,7 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
         'Search all messages (or one chat) for words, newest matches first. Words are matched whole, ignoring case and accents; several words must all appear; ' +
         '"quoted words" must appear together in order; a trailing * matches word starts (flight* finds flights). ' +
         'Messages are stored encrypted, so each search decrypts the history, which takes a few seconds. Put every search you need in `queries` ' +
-        'and the cost is paid once for all of them. To find everything with a person, use list_chats to get their chat. If nobody by that name exists, see unnamed_chats.',
+        'and the cost is paid once for all of them. Each hit shows its id; pass it to get_context to read the conversation around it. To find everything with a person, use list_chats to get their chat. If nobody by that name exists, see unnamed_chats.',
       inputSchema: {
         queries: z.array(z.string()).min(1).max(20).optional().describe('Several searches at once. Results come back grouped by query.'),
         query: z.string().optional().describe('One search. Same as queries with a single item.'),
@@ -154,15 +165,16 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
       const note = await fresh();
       let chatJid: string | undefined;
       if (chat) {
-        const m = (await wa.resolveChat(chat)) as { jid: string }[];
-        if (!m.length) return text(note + `No chat matches "${chat}". ${NAME_HINT}`);
-        chatJid = m[0].jid;
+        const c = await one(chat);
+        if ('error' in c) return text(note + c.error);
+        chatJid = c.jid;
       }
-      const { hits } = await wa.search({ queries: qs, chat: chatJid, since: epoch(since), until: epoch(until), limit });
-      const lines = (rows: typeof hits[number]) => rows.map((r) => `[${when(r.ts)}] ${r.chat_name} | ${r.sender}: ${clip(r.body)}${mediaTag(r, r.chat)}`).join('\n');
+      const { hits, more } = await h.search(qs, { chat: chatJid, since, until, limit });
+      const lines = (rows: typeof hits[number]) => rows.map((r) => `[${when(r.ts)}] ${r.chat_name} | ${r.sender}: ${clip(r.body)}${hitTag(r, r.chat)}`).join('\n');
+      const capped = (i: number) => (more[i] ? `\n(showing the newest ${limit}; there may be more. Raise limit or narrow with since/until.)` : '');
       const none = `No matches. If you were looking for something a particular person said, they may be saved only as a number. ${NAME_HINT}`;
-      if (qs.length === 1) return text(note + (hits[0].length ? lines(hits[0]) : none));
-      return text(note + qs.map((q, i) => `## ${q} (${hits[i].length} match${hits[i].length === 1 ? '' : 'es'})\n${hits[i].length ? lines(hits[i]) : 'No matches.'}`).join('\n\n'));
+      if (qs.length === 1) return text(note + (hits[0].length ? lines(hits[0]) + capped(0) : none));
+      return text(note + qs.map((q, i) => `## ${q} (${hits[i].length} match${hits[i].length === 1 ? '' : 'es'})\n${hits[i].length ? lines(hits[i]) + capped(i) : 'No matches.'}`).join('\n\n'));
     },
   );
 
@@ -181,8 +193,7 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
     },
     async ({ since, limit }) => {
       const note = await fresh();
-      const from = epoch(since) ?? Math.floor(Date.now() / 1000) - 14 * 86400;
-      const rows = (await wa.unanswered({ since: from, limit })) as Rows;
+      const { since: from, rows } = await h.unanswered({ since, limit });
       if (!rows.length) return text(note + `No direct chats are waiting on a reply since ${when(from)}.`);
       const lines = rows.map(
         (r) => `${r.name} | ${r.waiting}${r.more ? '+' : ''} waiting since ${when(r.since)} | last ${when(r.last_ts)}: "${oneLine(r.last, 160)}" | ${r.jid}`,
@@ -215,9 +226,9 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
       const firstDay = addDays(last, -(days - 1));
       const from = zoneMidnight(firstDay, TZ), to = zoneMidnight(addDays(last, 1), TZ);
       const [{ chats, total }, ua, notes] = await Promise.all([
-        wa.digest({ from, to, groups: include_groups, perChat: per_chat, maxChats: 50 }),
-        wa.unanswered({ since: from - 14 * 86400, limit: 100 }) as Promise<Rows>,
-        wa.notes({ open: true, limit: 500 }) as Promise<Note[]>,
+        h.store.digest({ from, to, groups: include_groups, perChat: per_chat, maxChats: 50 }),
+        h.unanswered({ since: from - 14 * 86400, limit: 100 }).then((u) => u.rows),
+        h.notes({ open: true, limit: 500 }),
       ]);
       const notesOf = new Map<string, Note[]>();
       for (const n of notes) if (n.jid) notesOf.set(n.jid, [...(notesOf.get(n.jid) ?? []), n]);
@@ -258,21 +269,10 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
     },
   );
 
-  /** A chat for the media tools: a jid as shown, or a name that matches exactly one chat. */
-  const oneChat = async (chat: string): Promise<{ jid: string } | { error: string }> => {
-    const m = (await wa.resolveChat(chat)) as { jid: string; name: string }[];
-    if (!m.length) return { error: `No chat matches "${chat}". Pass the jid shown with the media id.` };
-    if (m.length > 1 && !chat.includes('@')) return { error: `"${chat}" matches several chats, pass the jid:\n` + m.map((c) => `${c.name} | ${c.jid}`).join('\n') };
-    return { jid: m[0].jid };
-  };
-
+  /** A chat for the media tools: a jid as shown, or a name that matches one chat. */
+  const oneChat = (chat: string) => one(chat, { hint: 'Pass the jid shown with the media id.' });
   /** A chat for notes: like oneChat, but a phone number that has no chat yet is fine too. */
-  const noteChat = async (chat: string): Promise<{ jid: string } | { error: string }> => {
-    const c = await oneChat(chat);
-    if (!('error' in c)) return c;
-    const jid = /^[+\d][\d\s()-]{5,}$/.test(chat.trim()) ? toJid(chat.trim(), env.DEFAULT_COUNTRY_CODE) : null;
-    return jid ? { jid } : { error: c.error.replace('Pass the jid shown with the media id.', 'Pass the jid from list_chats, or a phone number.') };
-  };
+  const noteChat = (chat: string) => one(chat, { phone: true, hint: 'Pass the jid from list_chats, or a phone number.' });
   const remindDay = (d: string) => zoneMidnight(d.trim(), TZ);
 
   server.registerTool(
@@ -297,8 +297,8 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
         jid = c.jid;
       }
       const due = remind_on ? remindDay(remind_on) : null;
-      const id = await wa.addNote(jid, body.trim(), due);
-      const name = jid ? (await wa.resolveChat(jid))[0]?.name ?? displayNumber(jid) : null;
+      const id = await book.addNote(jid, body.trim(), due);
+      const name = jid ? await h.name(jid) : null;
       return text(`Saved note #${id}${name ? ` for ${name}` : ''}${due ? `, reminder on ${dayOf(due)}` : ''}.`);
     },
   );
@@ -323,7 +323,7 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
         jid = c.jid;
       }
       const dueBy = due_by ? zoneMidnight(addDays(due_by.trim(), 1), TZ) : undefined;
-      const notes = (await wa.notes({ jid, open: !include_done, dueBy, limit })) as Note[];
+      const notes = await h.notes({ jid, open: !include_done, dueBy, limit });
       if (!notes.length) return text(`No ${include_done ? '' : 'open '}notes${chat ? ` for ${chat}` : ''}${due_by ? ` due by ${due_by}` : ''}.`);
       return text(notes.map((n) => `${noteLine(n, !jid)} (saved ${dayOf(n.created)})`).join('\n'));
     },
@@ -345,16 +345,77 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
     async ({ id, done, text: body, remind_on, delete: del }) => {
-      if (del) return text((await wa.deleteNote(id)) ? `Deleted note #${id}.` : `There is no note #${id}.`);
+      if (del) return text((await book.deleteNote(id)) ? `Deleted note #${id}.` : `There is no note #${id}.`);
       const due = remind_on === undefined ? undefined : remind_on.trim().toLowerCase() === 'none' ? null : remindDay(remind_on);
       if (done === undefined && body === undefined && due === undefined) return text('Nothing to change: pass done, text, remind_on or delete.');
-      const ok = await wa.updateNote(id, { done, text: body?.trim(), due });
+      const ok = await book.updateNote(id, { done, text: body?.trim(), due });
       if (!ok) return text(`There is no note #${id}.`);
       const parts = [done === true && 'marked done', done === false && 'reopened', body !== undefined && 'text changed',
         due === null && 'reminder cleared', typeof due === 'number' && `reminder on ${dayOf(due)}`].filter(Boolean);
       return text(`Note #${id}: ${parts.join(', ')}.`);
     },
   );
+
+  server.registerTool(
+    'get_context',
+    {
+      description:
+        'Read the conversation around one message: the messages just before and after it in the same chat, oldest first, with the message itself marked >>. ' +
+        'Take `chat` and `message_id` from the "(id: ... in ...)" or "(media id: ... in ...)" shown on a search_messages hit.',
+      inputSchema: {
+        chat: z.string().describe('Chat jid, or a name that matches one chat'),
+        message_id: z.string(),
+        before: z.number().int().min(0).max(100).default(10).describe('Messages to show before it'),
+        after: z.number().int().min(0).max(100).default(10).describe('Messages to show after it'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ chat, message_id, before, after }) => {
+      const c = await oneChat(chat);
+      if ('error' in c) return text(c.error);
+      const r = await h.context(c.jid, message_id, before, after);
+      if (!r) return text(`No message with id ${message_id} in that chat. Ids come from search_messages hits, and belong to the chat shown with them.`);
+      const name = c.name;
+      const lines = r.messages.map((m) => `${m.id === r.target ? '>> ' : ''}[${when(m.ts)}] ${m.sender}${replyTag(m)}: ${m.body}${mediaTag(m)}`);
+      return text(`# ${name} around ${when(r.messages.find((m) => m.id === r.target)!.ts)}\n${lines.join('\n')}`);
+    },
+  );
+
+  server.registerTool(
+    'chat_activity',
+    {
+      description:
+        'Who talked and how much over a period. Without `chat`: the busiest chats, with how many of the messages were the user\'s. ' +
+        'With `chat`: the busiest people in that chat. Counts only, so it is fast; read the messages with get_messages. ' +
+        'Good for "what did I miss this week" (find the busy chats first) or "who is most active in this group". Reactions are not counted. Default period: the last 7 days.',
+      inputSchema: {
+        since: z.string().optional().describe('ISO date/time. Default: 7 days ago'),
+        until: z.string().optional().describe('ISO date/time. Default: now'),
+        chat: z.string().optional().describe('One chat (jid or a name that matches one chat) to break down by person'),
+        limit: z.number().int().min(1).max(100).default(20),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ since, until, chat, limit }) => {
+      const note = await fresh();
+      let jid: string | undefined, chatName = '';
+      if (chat) {
+        const c = await oneChat(chat);
+        if ('error' in c) return text(note + c.error);
+        jid = c.jid; chatName = c.name;
+      }
+      const r = await h.activity({ since, until, chat: jid, limit });
+      const from = r.since, to = r.until;
+      const span = `${when(from)} to ${when(to)}`;
+      if (!r.totals.messages) return text(note + `No messages ${jid ? 'in that chat ' : ''}between ${span}.`);
+      const head = `${r.totals.messages} messages (${r.totals.mine} from the user)${jid ? '' : ` in ${r.totals.chats} chats`}, ${span}.`;
+      if (jid) {
+        return text(note + `# ${chatName}\n${head}\n` + r.people.map((p) => `${p.name} | ${p.messages} msgs | last ${when(p.last_ts)}`).join('\n'));
+      }
+      return text(note + head + '\n' + r.chats.map((c) => `${c.name}${c.is_group ? ' [group]' : ''} | ${c.messages} msgs (${c.mine} mine) | last ${when(c.last_ts)} | ${c.jid}`).join('\n'));
+    },
+  );
+
 
   server.registerTool(
     'get_media',
@@ -374,7 +435,7 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
     async ({ chat, message_id }) => {
       const c = await oneChat(chat);
       if ('error' in c) return text(c.error);
-      const r = await wa.fetchMedia(c.jid, message_id);
+      const r = await acct.fetchMedia(c.jid, message_id);
       if (!r.ok) return { content: [{ type: 'text' as const, text: `Could not get that file: ${r.error}.` }], isError: true };
       const mime = r.mime.split(';')[0].trim();
       const about = { type: 'text' as const, text: `${r.kind}${r.name ? ` "${r.name}"` : ''}, ${mime}, ${Math.ceil(r.size / 1024)} KB${r.reuploaded ? ' (uploaded again by the phone)' : ''}` };
@@ -403,7 +464,7 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
       async ({ chat, message_ids }) => {
         const c = await oneChat(chat);
         if ('error' in c) return text(c.error);
-        const rows = await wa.transcribeAudio(c.jid, message_ids);
+        const rows = await acct.transcribeAudio(c.jid, message_ids);
         return text(rows.map((r) => (r.ok ? `${r.id}: ${r.text}` : `${r.id}: could not transcribe (${r.text})`)).join('\n\n'));
       },
     );
@@ -420,7 +481,7 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
       annotations: { readOnlyHint: true },
     },
     async ({ limit }) => {
-      const rows = (await wa.unnamedChats(limit)) as Rows;
+      const rows = (await h.store.unnamedChats(limit)) as Rows;
       if (!rows.length) return text('Every chat has a name.');
       const lines = rows.map((r) => {
         const said = r.last_theirs ? ` | they last said: "${oneLine(r.last_theirs, 120)}"` : '';
@@ -459,10 +520,10 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
         const jid = raw.includes('@') ? raw : toJid(raw, env.DEFAULT_COUNTRY_CODE);
         const name = n.name.trim().slice(0, 100);
         // a number or a masked placeholder isn't a name
-        if (!jid || /∙/.test(name) || (name && /^[\d\s+-]*$/.test(name))) bad.push(raw);
+        if (!jid || (name && isPlaceholder(name))) bad.push(raw);
         else rows.push({ jid, name });
       }
-      const r = rows.length ? await wa.setNames(rows) : { saved: 0, removed: 0, withChat: 0 };
+      const r = rows.length ? await book.setCustomNames(rows) : { saved: 0, removed: 0, withChat: 0 };
       const parts = [
         `Saved ${r.saved} name${r.saved === 1 ? '' : 's'}${r.removed ? `, removed ${r.removed}` : ''}. ${r.withChat} of ${rows.length} numbers have a chat here.`,
       ];
@@ -483,7 +544,7 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
       annotations: { readOnlyHint: true },
     },
     async () => {
-      const i = await wa.linkInfo();
+      const i = await acct.linkInfo();
       const dm = i.contact ? ` The operator is @${i.contact} on X.` : '';
       if (i.rejected) {
         return text(`Not linked. This history was larger than the service takes (${i.rejected.messages.toLocaleString()} messages; the limit is ${i.limits.messages ? `${i.limits.messages.toLocaleString()} messages` : `${i.limits.mb} MB`}), so it was not kept and the phone was unlinked. Nothing is stored.${dm}`);
@@ -505,7 +566,7 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
       annotations: { destructiveHint: true },
     },
     async () => {
-      await wa.logout();
+      await acct.logout();
       return text(`Unlinked. Ask the owner to open ${origin}/setup and scan the QR code (WhatsApp > Settings > Linked Devices > Link a Device). History is re-imported on the new link; stored messages are kept.`);
     },
   );
@@ -517,9 +578,9 @@ export function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, orig
       inputSchema: {},
     },
     async () => {
-      if (!(await wa.isPaired())) return text(`WhatsApp is not linked yet. Open ${origin}/setup to scan the QR code.`);
-      const r = await wa.pull();
-      const c = await wa.counts();
+      if (!(await h.isPaired())) return text(`WhatsApp is not linked yet. Open ${origin}/setup to scan the QR code.`);
+      const r = await acct.pull();
+      const c = await h.store.counts();
       return text(`Pulled ${r.added} new messages in ${(r.ms / 1000).toFixed(1)}s (${r.reason}). Store now holds ${c.messages} messages across ${c.chats} chats.`);
     },
   );
@@ -531,8 +592,8 @@ export async function handleMcp(request: Request, env: Env, who: McpProps): Prom
   // Stateless: no server-to-client stream (GET) and no session to end (DELETE). The spec's answer is 405.
   // Without it the SDK opens a stream that never sends, the request dies, and clients reconnect in a tight loop.
   if (request.method !== 'POST') return new Response(null, { status: 405, headers: { allow: 'POST' } });
-  const wa = await unlockedStub(env, who);
-  const server = buildServer(wa, env, new URL(request.url).origin, await wa.timezone());
+  const { account, store, history } = await connect(env, who);
+  const server = buildServer(history, store, account as unknown as AccountOps, env, new URL(request.url).origin);
   const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   await server.connect(transport);
   return transport.handleRequest(request);

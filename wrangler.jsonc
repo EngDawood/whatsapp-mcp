@@ -14,8 +14,8 @@
 	,
 	// Baileys needs three things workerd doesn't have. See "What to know before changing things" in the README.
 	"alias": {
-		"ws": "./src/ws-shim.ts",
-		"lru-cache": "./src/lru-shim.ts",
+		"ws": "./src/platform/ws-shim.ts",
+		"lru-cache": "./src/platform/lru-shim.ts",
 		"whatsapp-rust-bridge": "./vendor/whatsapp-rust-bridge/index.js"
 	},
 	"rules": [

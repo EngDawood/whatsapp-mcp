@@ -1,31 +1,27 @@
 /**
- * WhatsAppStore - the paired WhatsApp session and message store, one per user.
+ * An open account: everything that needs the owner's key. The message store, the WhatsApp session (pulls and
+ * pairing), media and transcripts. Only WhatsAppStore.open(key) makes one, so nothing keyed can run on a locked
+ * account.
  *
- * Everything the user owns is sealed with their data key, which this object only ever holds in memory:
- * the Worker passes it to unlock() at the start of each request and it is gone when the object is evicted.
- * Only a few things need no key: the account record (a wrapped key, useless without the password), login
- * throttling, and flags like "is a phone linked".
+ * Pull model: nothing stays connected. pull() opens a Baileys socket, lets WhatsApp deliver whatever it queued for
+ * this linked device since we last connected, writes it to SQLite, and hangs up. Pairing is the same session with the
+ * QR exposed and a longer leash, so the first full history sync lands.
  *
- * Pull model: nothing stays connected. pull() opens a Baileys socket, lets
- * WhatsApp deliver whatever it queued for this linked device since we last
- * connected, writes it to SQLite, and hangs up. Pairing is the same session
- * with the QR exposed and a longer leash, so the first full history sync lands.
+ * The Worker reaches it as an RPC stub (it is an RpcTarget), and reaches the store through history().
  */
-import { liveIntervals } from './polyfills.js';
-import { DurableObject } from 'cloudflare:workers';
+import { RpcTarget } from 'cloudflare:workers';
+import { liveIntervals } from '../platform/polyfills.js';
 import { makeWASocket, DisconnectReason } from '@whiskeysockets/baileys';
 import type { WASocket } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-generator';
-import { sqliteAuthState } from './auth-state.js';
-import { Store, hasSchema, initSchema, isLeftover, isLegacy, migrateLegacy } from './store.js';
-import type { MediaKind, MediaRef } from './store.js';
+import type { sqliteAuthState } from './auth-state.js';
+import { initSchema, type Store } from '../store/store.js';
+import type { MediaKind, MediaRef } from './translate.js';
 import { downloadMedia } from './media.js';
 import { MAX_AUDIO_BYTES, transcribe } from './transcribe.js';
-import { Vault } from './vault.js';
-import { limitsOf, verdict } from './limits.js';
-import { contactText, xHandle } from './ui.js';
-import type { AccountRecord } from './vault.js';
-import type { Env } from './index.js';
+import { limitsOf, verdict } from '../account/limits.js';
+import { contactText, xHandle } from '../web/ui.js';
+import type { Env } from '../index.js';
 
 type Phase = 'idle' | 'connecting' | 'qr' | 'syncing';
 export interface SessionResult { reason: string; added: number; ms: number }
@@ -51,20 +47,18 @@ const silent = (sink?: (level: string, args: unknown[]) => void) => {
   return l;
 };
 
-const LOCK_AFTER = 5;
-const MAX_LOCK_MS = 60 * 60_000;
-const b64 = (b: ArrayBuffer) => Buffer.from(b).toString('base64');
+/** What the Durable Object lends an open account: its storage, its config, the keyless flags and the event log. */
+export interface Host {
+  ctx: DurableObjectState;
+  env: Env;
+  meta(k: string): string | null;
+  setMeta(k: string, v: string): void;
+  note(msg: string): void;
+  /** Drop this open account (after its data is erased). */
+  forget(): void;
+}
 
-interface Unlocked { dek: string; vault: Vault; auth: ReturnType<typeof sqliteAuthState>; store: Store }
-
-export class WhatsAppStore extends DurableObject<Env> {
-  private unlocked: Unlocked | null = null;
-  private get auth() { return this.keyed().auth; }
-  private get store() { return this.keyed().store; }
-  private keyed(): Unlocked {
-    if (!this.unlocked) throw new Error('locked');
-    return this.unlocked;
-  }
+export class Account extends RpcTarget {
   private session: Promise<SessionResult> | null = null;
   private phase: Phase = 'idle';
   private qr: string | null = null;
@@ -72,97 +66,19 @@ export class WhatsAppStore extends DurableObject<Env> {
   private lastPoll = 0;
   private sessionAdded = 0;
   private historyProgress: number | null = null;
-  private events: string[] = [];
 
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    // Signing in asks every new person's object whether they have an account. Creating tables to answer that
-    // would leave storage behind for everyone, including people turned away because the service is full.
-    // So tables are made when an account is, and an empty leftover from before that is erased.
-    const sql = ctx.storage.sql;
-    if (isLeftover(sql)) ctx.blockConcurrencyWhile(() => ctx.storage.deleteAll());
-    else if (hasSchema(sql)) initSchema(sql);
-  }
+  constructor(private host: Host, private auth: ReturnType<typeof sqliteAuthState>, private store: Store) { super(); }
 
-  // ---------- accounts and keys (no key needed) ----------
+  /** The message store: chats, messages, search, names, notes. */
+  history(): Store { return this.store; }
 
-  /** The stored account, and how long a login must wait if there have been too many wrong passwords. */
-  account(): { record: AccountRecord | null; retryAfter: number } {
-    const sql = this.ctx.storage.sql;
-    if (!hasSchema(sql)) return { record: null, retryAfter: 0 };
-    const row = sql.exec<{ v: string }>(`SELECT v FROM account WHERE k = 'record'`).toArray()[0];
-    const until = Number(this.meta('locked_until') ?? 0);
-    return { record: row ? JSON.parse(row.v) : null, retryAfter: Math.max(0, until - Date.now()) };
-  }
+  isPaired(): boolean { return this.host.meta('paired') === '1'; }
+  timezone(): string { return this.host.env.TIMEZONE || this.host.meta('tz') || 'UTC'; }
+  /** Keeps the Durable Object alive while a session runs (see WhatsAppStore.alarm). */
+  async idle() { await this.session?.catch(() => {}); }
+  /** Session state for the operator's /debug view. No content. */
+  sessionPhase(): Phase { return this.phase; }
 
-  /** Create the account. False if there already is one, so two signups for the same login can't both win. */
-  createAccount(record: AccountRecord, timezone: string): boolean {
-    const sql = this.ctx.storage.sql;
-    initSchema(sql);
-    if (sql.exec(`SELECT 1 FROM account WHERE k = 'record'`).toArray().length) return false;
-    sql.exec(`INSERT INTO account (k, v) VALUES ('record', ?)`, JSON.stringify(record));
-    this.setMeta('tz', timezone);
-    return true;
-  }
-
-  /** Slow down password guessing: five wrong passwords in a row, then longer and longer waits. */
-  noteLogin(ok: boolean) {
-    // a wrong password before there is an account: no tables yet (see the constructor), and nothing to lock
-    if (!hasSchema(this.ctx.storage.sql)) return;
-    if (ok) { this.setMeta('fails', '0'); this.setMeta('locked_until', '0'); return; }
-    const fails = Number(this.meta('fails') ?? 0) + 1;
-    this.setMeta('fails', String(fails));
-    if (fails >= LOCK_AFTER) this.setMeta('locked_until', String(Date.now() + Math.min(MAX_LOCK_MS, 30_000 * 2 ** (fails - LOCK_AFTER))));
-  }
-
-  /** Swap in a new password wrapping for the same key. */
-  replaceAccount(record: AccountRecord) {
-    this.ctx.storage.sql.exec(`UPDATE account SET v = ? WHERE k = 'record'`, JSON.stringify(record));
-  }
-
-  /** TIMEZONE, when set, wins over the zone saved at sign-up, so a wrong first guess can be fixed without a new account. */
-  timezone(): string { return this.env.TIMEZONE || this.meta('tz') || 'UTC'; }
-  /** Is a phone linked? Remembered in the clear because it is asked before there is a key. */
-  isPaired(): boolean { return this.meta('paired') === '1'; }
-
-  private meta(k: string): string | null {
-    return this.ctx.storage.sql.exec<{ v: string }>(`SELECT v FROM meta WHERE k = ?`, k).toArray()[0]?.v ?? null;
-  }
-  private setMeta(k: string, v: string) {
-    this.ctx.storage.sql.exec(`INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)`, k, v);
-  }
-
-  /**
-   * Hand this object the user's data key (base64) for the rest of this request and the session it may start.
-   * The first call after an upgrade from the plaintext release encrypts what was stored. A wrong key is refused.
-   */
-  unlock(dek: string) {
-    if (this.unlocked?.dek === dek) return;
-    const sql = this.ctx.storage.sql;
-    if (!hasSchema(sql)) throw new Error('no account');
-    const tx = <T>(fn: () => T) => this.ctx.storage.transactionSync(fn);
-    const vault = Vault.fromBase64(dek);
-    if (isLegacy(sql)) migrateLegacy(sql, vault, tx);
-    const canary = this.meta('canary');
-    if (canary) {
-      try { vault.open(Buffer.from(canary, 'base64'), 'canary'); } catch { throw new Error('wrong key'); }
-    } else {
-      this.setMeta('canary', b64(vault.seal('ok', 'canary')));
-    }
-    // told on every unlock and every creds save; only a change is worth a write
-    const auth = sqliteAuthState(sql, vault, (paired) => {
-      const v = paired ? '1' : '0';
-      if (this.meta('paired') !== v) this.setMeta('paired', v);
-    });
-    this.unlocked = { dek, vault, auth, store: new Store(sql, tx, vault) };
-  }
-
-  private note(msg: string) {
-    this.events.push(`${new Date().toISOString().slice(11, 19)} ${msg}`);
-    if (this.events.length > 80) this.events.shift();
-  }
-
-  // ---------- RPC for the Worker ----------
 
   /** Everything the pairing page needs, and a heartbeat that keeps the pairing session alive. */
   pairStatus() {
@@ -190,11 +106,11 @@ export class WhatsAppStore extends DurableObject<Env> {
   /** Begin (or continue) a pairing session. Runs in the alarm so it outlives this request. */
   async startPairing() {
     this.lastPoll = Date.now();
-    this.ctx.storage.sql.exec(`DELETE FROM meta WHERE k IN ('rejected', 'full')`);
+    this.host.ctx.storage.sql.exec(`DELETE FROM meta WHERE k IN ('rejected', 'full')`);
     if (!this.session) {
       this.session = this.runSession({ pairing: true, maxMs: PAIR_MAX_MS, idleMs: 8_000 })
         .finally(() => { this.session = null; });
-      await this.ctx.storage.setAlarm(Date.now() + 50);
+      await this.host.ctx.storage.setAlarm(Date.now() + 50);
     }
   }
 
@@ -208,21 +124,17 @@ export class WhatsAppStore extends DurableObject<Env> {
     return this.pairingCode;
   }
 
-  async alarm() {
-    await this.session?.catch(() => {}); // holding the alarm open keeps the DO alive while the session runs
-  }
-
   /** Unlink this device on WhatsApp's side (so it vanishes from the phone's list), then forget the session. Messages stay. */
   async logout() {
     if (this.auth.isPaired()) {
       try {
         await this.unlinkOnServer();
       } catch (e: any) {
-        this.note(`server-side unlink failed: ${e?.message}; remove the device in WhatsApp > Linked Devices`);
+        this.host.note(`server-side unlink failed: ${e?.message}; remove the device in WhatsApp > Linked Devices`);
       }
     }
     this.auth.clear();
-    this.ctx.storage.sql.exec(`DELETE FROM meta WHERE k = 'last_pull'`);
+    this.host.ctx.storage.sql.exec(`DELETE FROM meta WHERE k = 'last_pull'`);
   }
 
   private async unlinkOnServer() {
@@ -244,9 +156,9 @@ export class WhatsAppStore extends DurableObject<Env> {
   /** Unlink from WhatsApp and erase everything this person has here: messages, names, keys, the account itself. */
   async destroy() {
     try { await this.logout(); } catch {}
-    await this.ctx.storage.deleteAlarm();
-    await this.ctx.storage.deleteAll();
-    this.unlocked = null; // a later sign-up on this login makes fresh tables in createAccount
+    await this.host.ctx.storage.deleteAlarm();
+    await this.host.ctx.storage.deleteAll();
+    this.host.forget(); // a later sign-up on this login makes fresh tables in createAccount
   }
 
   linkInfo() {
@@ -259,40 +171,40 @@ export class WhatsAppStore extends DurableObject<Env> {
 
   /** Where this account stands against the size limits, for the pages and the agent to explain. */
   private standing() {
-    const lim = limitsOf(this.env);
-    const rejected = this.meta('rejected');
+    const lim = limitsOf(this.host.env);
+    const rejected = this.host.meta('rejected');
     return {
       rejected: rejected ? (JSON.parse(rejected) as { messages: number; at: number }) : null,
-      full: this.meta('full') === '1',
+      full: this.host.meta('full') === '1',
       limits: { messages: lim.messages, mb: Math.round(lim.bytes / 1024 / 1024) },
-      contact: xHandle(this.env.CONTACT_X) ?? null,
+      contact: xHandle(this.host.env.CONTACT_X) ?? null,
     };
   }
 
   private size() {
-    return { messages: this.store.counts().messages, bytes: this.ctx.storage.sql.databaseSize ?? 0 };
+    return { messages: this.store.counts().messages, bytes: this.host.ctx.storage.sql.databaseSize ?? 0 };
   }
 
   /** A history that is too big for this service: unlink the phone and delete what arrived. Runs after the session has ended. */
   private async reject(total: number) {
-    this.setMeta('rejected', JSON.stringify({ messages: total, at: Date.now() }));
+    this.host.setMeta('rejected', JSON.stringify({ messages: total, at: Date.now() }));
     await this.logout();
     // chat_stats and lid_senders go first, so deleting the messages doesn't run the stats triggers row by row
-    this.ctx.storage.sql.exec(`DROP TRIGGER IF EXISTS chat_stats_ad`);
-    for (const t of ['chat_stats', 'lid_senders', 'messages', 'chats', 'contacts', 'custom_names', 'alias', 'notes']) this.ctx.storage.sql.exec(`DELETE FROM ${t}`);
-    initSchema(this.ctx.storage.sql); // puts the trigger back
-    this.keyed().store.reset();
+    this.host.ctx.storage.sql.exec(`DROP TRIGGER IF EXISTS chat_stats_ad`);
+    for (const t of ['chat_stats', 'lid_senders', 'messages', 'chats', 'contacts', 'custom_names', 'alias', 'notes']) this.host.ctx.storage.sql.exec(`DELETE FROM ${t}`);
+    initSchema(this.host.ctx.storage.sql); // puts the trigger back
+    this.store.reset();
   }
 
   /** Pull anything new from WhatsApp. Safe to call concurrently; callers share one session. */
   async pull(): Promise<SessionResult> {
     if (!this.auth.isPaired()) throw new Error('not paired');
-    if (this.meta('full') === '1') {
+    if (this.host.meta('full') === '1') {
       // an account that was full may have room now, if the operator raised the limit or messages were removed
-      if (verdict(this.size(), limitsOf(this.env), false)) {
-        throw new Error(`This account has reached the size limit for this service, so new messages aren't being added.${contactText(this.env.CONTACT_X)}`);
+      if (verdict(this.size(), limitsOf(this.host.env), false)) {
+        throw new Error(`This account has reached the size limit for this service, so new messages aren't being added.${contactText(this.host.env.CONTACT_X)}`);
       }
-      this.ctx.storage.sql.exec(`DELETE FROM meta WHERE k = 'full'`);
+      this.host.ctx.storage.sql.exec(`DELETE FROM meta WHERE k = 'full'`);
     }
     if (!this.session) {
       this.session = this.runSession({ pairing: false, maxMs: PULL_MAX_MS, idleMs: 4_000 })
@@ -306,31 +218,6 @@ export class WhatsAppStore extends DurableObject<Env> {
     if (Date.now() - this.lastPull() < maxAgeMs) return null;
     return this.pull();
   }
-
-  /** What is safe to show without a key: the state of the session and its log. Never message content. */
-  debug() {
-    const one = (q: string) => this.ctx.storage.sql.exec<{ n: number }>(q).toArray()[0].n;
-    return {
-      phase: this.phase, paired: this.isPaired(), unlocked: Boolean(this.unlocked), lastPull: Number(this.meta('last_pull') ?? 0),
-      messages: one(`SELECT COUNT(*) n FROM messages`), events: this.events,
-    };
-  }
-
-  // ---------- queries (all read-only) ----------
-
-  listChats(query: string | undefined, limit: number) { return this.store.listChats(query, limit); }
-  resolveChat(ref: string) { return this.store.resolveChat(ref); }
-  getMessages(o: Parameters<Store['getMessages']>[0]) { return this.store.getMessages(o); }
-  search(o: Parameters<Store['search']>[0]) { return this.store.search(o); }
-  counts() { return this.store.counts(); }
-  unnamedChats(limit: number) { return this.store.unnamedChats(limit); }
-  unanswered(o: Parameters<Store['unanswered']>[0]) { return this.store.unanswered(o); }
-  digest(o: Parameters<Store['digest']>[0]) { return this.store.digest(o); }
-  addNote(jid: string | null, text: string, due: number | null) { return this.store.addNote(jid, text, due); }
-  notes(o: Parameters<Store['notes']>[0]) { return this.store.notes(o); }
-  updateNote(id: number, patch: Parameters<Store['updateNote']>[1]) { return this.store.updateNote(id, patch); }
-  deleteNote(id: number) { return this.store.deleteNote(id); }
-  setNames(rows: { jid: string; name: string }[]) { return this.store.setCustomNames(rows); }
 
   // ---------- media ----------
 
@@ -364,7 +251,7 @@ export class WhatsAppStore extends DurableObject<Env> {
       this.store.setMediaLocation(chat, id, loc);
       got = await downloadMedia({ ...ref, ...loc }, maxBytes);
     } catch (e: any) {
-      this.note(`media re-upload: ${e?.message}`);
+      this.host.note(`media re-upload: ${e?.message}`);
       return { ok: false, error: `${why}, and asking the phone to upload it again failed (${e?.message}). The phone has to be online and still have the file` };
     }
     return got.ok ? { ok: true, ref, bytes: got.bytes, reuploaded: true } : { ok: false, error: got.error };
@@ -375,7 +262,7 @@ export class WhatsAppStore extends DurableObject<Env> {
    * One result per id, in order.
    */
   async transcribeAudio(chat: string, ids: string[]): Promise<{ id: string; ok: boolean; text: string }[]> {
-    const ai = this.env.AI;
+    const ai = this.host.env.AI;
     if (!ai) return ids.map((id) => ({ id, ok: false, text: 'transcription is not set up on this server' }));
     const one = async (id: string): Promise<{ id: string; ok: boolean; text: string }> => {
       const m = this.store.media(chat, id);
@@ -384,11 +271,11 @@ export class WhatsAppStore extends DurableObject<Env> {
       const got = await this.mediaBytes(chat, id, MAX_AUDIO_BYTES);
       if (!got.ok) return { id, ok: false, text: got.error };
       try {
-        const text = (await transcribe(ai, got.bytes, { mime: got.ref.mime, model: this.env.TRANSCRIBE_MODEL })) || '[no speech]';
+        const text = (await transcribe(ai, got.bytes, { mime: got.ref.mime, model: this.host.env.TRANSCRIBE_MODEL })) || '[no speech]';
         this.store.setTranscript(chat, id, text);
         return { id, ok: true, text };
       } catch (e: any) {
-        this.note(`transcribe: ${e?.message}`.slice(0, 300));
+        this.host.note(`transcribe: ${e?.message}`.slice(0, 300));
         return { id, ok: false, text: `transcription failed (${e?.message ?? 'unknown error'})` };
       }
     };
@@ -454,18 +341,18 @@ export class WhatsAppStore extends DurableObject<Env> {
       let restarts = 0;
       const touch = () => { lastActivity = Date.now(); };
       const baseCount = this.store.counts().messages;
-      const limits = limitsOf(this.env);
+      const limits = limitsOf(this.host.env);
 
       /** After each batch of messages: is the account too big? */
       const guard = async () => {
         if (done) return;
         const total = baseCount + this.sessionAdded;
-        const v = verdict({ messages: total, bytes: this.ctx.storage.sql.databaseSize ?? 0 }, limits, opts.pairing);
+        const v = verdict({ messages: total, bytes: this.host.ctx.storage.sql.databaseSize ?? 0 }, limits, opts.pairing);
         if (!v) return;
-        this.note(`over the size limit (${total} messages): ${v}`);
+        this.host.note(`over the size limit (${total} messages): ${v}`);
         await finish(v === 'reject' ? 'rejected' : 'full');
         if (v === 'reject') await this.reject(total);
-        else this.setMeta('full', '1');
+        else this.host.setMeta('full', '1');
       };
 
       const finish = async (reason: string) => {
@@ -480,17 +367,17 @@ export class WhatsAppStore extends DurableObject<Env> {
         this.qr = null;
         this.pairingCode = null;
         if (this.auth.isPaired() && reason !== 'logged_out') this.store.setMeta('last_pull', String(Date.now()));
-        this.note(`session end: ${reason}, +${this.sessionAdded} messages`);
+        this.host.note(`session end: ${reason}, +${this.sessionAdded} messages`);
         resolve({ reason, added: this.sessionAdded, ms: Date.now() - started });
       };
 
       const connect = () => {
-        try { open(); } catch (e: any) { this.note(`connect error: ${e?.stack ?? e}`.slice(0, 600)); void finish('error'); }
+        try { open(); } catch (e: any) { this.host.note(`connect error: ${e?.stack ?? e}`.slice(0, 600)); void finish('error'); }
       };
       const open = () => {
         const sock = makeWASocket({
           auth: this.auth.state,
-          logger: silent((lvl, a) => this.note(`${lvl}: ${a.map(show).join(' ').slice(0, 300)}`)),
+          logger: silent((lvl, a) => this.host.note(`${lvl}: ${a.map(show).join(' ').slice(0, 300)}`)),
           syncFullHistory: true,
           markOnlineOnConnect: false, // stay invisible so the phone keeps notifying
           generateHighQualityLinkPreview: false,
@@ -505,20 +392,20 @@ export class WhatsAppStore extends DurableObject<Env> {
 
             if (ev['connection.update']) {
               const u = ev['connection.update'];
-              if (u.qr) { this.qr = u.qr; this.phase = 'qr'; this.note('qr'); }
-              if (u.receivedPendingNotifications) { backlogDelivered = true; this.note('backlog delivered'); }
+              if (u.qr) { this.qr = u.qr; this.phase = 'qr'; this.host.note('qr'); }
+              if (u.receivedPendingNotifications) { backlogDelivered = true; this.host.note('backlog delivered'); }
               if (u.connection === 'open') {
                 this.qr = null;
                 this.phase = 'syncing';
-                this.note('open');
+                this.host.note('open');
                 // group names only come from an explicit fetch
                 sock.groupFetchAllParticipating()
                   .then((g) => this.store.upsertChatNames(Object.values(g)))
-                  .catch((e) => this.note(`groups: ${e?.message}`));
+                  .catch((e) => this.host.note(`groups: ${e?.message}`));
               }
               if (u.connection === 'close') {
                 const code = (u.lastDisconnect?.error as any)?.output?.statusCode;
-                this.note(`close ${code}`);
+                this.host.note(`close ${code}`);
                 if (code === DisconnectReason.loggedOut) {
                   this.auth.clear();
                   await finish('logged_out');
@@ -541,7 +428,7 @@ export class WhatsAppStore extends DurableObject<Env> {
               this.store.upsertChatNames(h.chats ?? []);
               this.sessionAdded += this.store.ingestMessages(h.messages ?? []);
               if (typeof h.progress === 'number') this.historyProgress = h.progress;
-              this.note(`history chunk: ${h.messages?.length ?? 0} msgs, progress ${h.progress ?? '-'}`);
+              this.host.note(`history chunk: ${h.messages?.length ?? 0} msgs, progress ${h.progress ?? '-'}`);
             }
             if (ev['messages.upsert']) this.sessionAdded += this.store.ingestMessages(ev['messages.upsert'].messages);
             if (ev['messaging-history.set'] || ev['messages.upsert']) await guard();
@@ -553,7 +440,7 @@ export class WhatsAppStore extends DurableObject<Env> {
             if (ev['groups.upsert']) this.store.upsertChatNames(ev['groups.upsert']);
             if (ev['groups.update']) this.store.upsertChatNames(ev['groups.update'] as any);
           } catch (e: any) {
-            this.note(`handler error: ${e?.message}`);
+            this.host.note(`handler error: ${e?.message}`);
           }
         });
       };

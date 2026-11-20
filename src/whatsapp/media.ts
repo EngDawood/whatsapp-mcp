@@ -6,7 +6,7 @@
  * an AES-256-CBC key and an HMAC-SHA256 key. The file is the ciphertext followed by the first 10 bytes of
  * HMAC(iv || ciphertext). WebCrypto does all of it, so it runs the same on Workers and under local workerd.
  */
-import type { MediaKind, MediaRef } from './store.js';
+import type { MediaKind, MediaRef } from './translate.js';
 
 const INFO: Record<MediaKind, string> = {
   image: 'WhatsApp Image Keys',
