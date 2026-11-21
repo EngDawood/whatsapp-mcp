@@ -63,7 +63,7 @@ export function buildServer(h: History, book: Notebook, acct: AccountOps, env: E
     {
       instructions:
         `Access to the user's WhatsApp history. It can read and search messages and save names for phone numbers; it cannot send anything. Timestamps are ${TZ}. ` +
-        `Each read first pulls anything new from WhatsApp if the store is more than a few minutes old. ` +
+        `Each read first pulls anything new from WhatsApp if the store is more than 30 minutes old; call sync_now first only when the user needs messages from the last half hour. ` +
         `Use list_chats to find a chat, get_messages to read it, search_messages to find things across chats, get_context to read around a search hit, ` +
         `chat_activity for who talked how much over a period, and unanswered_chats for direct messages still waiting on a reply. ` +
         `Photos, voice notes, videos, documents and stickers show as labels with a media id; get_media fetches the file` +
