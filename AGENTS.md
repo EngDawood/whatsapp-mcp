@@ -1,6 +1,6 @@
 # whatsapp-mcp (EngDawood fork)
 
-A single-user, read-only MCP server over the owner's WhatsApp Business chats, running on the owner's Cloudflare Workers Paid account at `https://whatsapp-mcp.engdawood.workers.dev`. The owner's assistant (Meta Muse, Claude) uses it for an end-of-day summary, reminders about customers waiting on a reply, and notes about customers. Imported as one commit from [finereli/whatsapp-mcp](https://github.com/finereli/whatsapp-mcp) (MIT); `README.md` is the upstream manual plus a fork note, and is the reference for architecture, crypto and setup.
+A single-user, read-only MCP server over the owner's WhatsApp Business chats, running on the owner's Cloudflare Workers Paid account at `https://whatsapp-mcp.engdawood.workers.dev`. The owner's assistant (Meta Muse, Claude) uses it for an end-of-day summary, reminders about customers waiting on a reply, and notes about customers. Imported as one commit from [finereli/whatsapp-mcp](https://github.com/finereli/whatsapp-mcp) (MIT); `README.md` documents this deployment (setup, tools, ban-risk practice) and the architecture, crypto and data model; upstream's multi-user and Docker docs were dropped from it.
 
 ## Invariants
 
