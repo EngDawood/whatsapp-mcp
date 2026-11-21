@@ -95,7 +95,7 @@ Workers Paid is required: the first history import needs more CPU than the free 
 
 **Media is fetched when asked for, never stored.** Photos, voice notes, videos, documents and stickers appear as labels with a media id. `get_media` downloads the encrypted file from WhatsApp's CDN, decrypts it in memory and hands it to the assistant; only what it takes to fetch it again is kept. Files over 10 MB are refused. WhatsApp keeps files for a few weeks; after that the phone is asked to upload the file again, which works while it is online and still has it.
 
-**Voice notes can be transcribed, but aren't yet.** `transcribe_audio` exists only with a Workers AI binding (`"ai": { "binding": "AI" }` in `wrangler.jsonc`), which this deployment doesn't have. It costs about $0.0005 a minute of audio.
+**Voice notes can be transcribed.** `transcribe_audio` runs voice notes through Whisper (`@cf/openai/whisper-large-v3-turbo`, language detected automatically) on Workers AI, through the `AI` binding in `wrangler.jsonc`. The audio goes to Cloudflare's model and nowhere else, and only when an assistant asks. A transcript is kept sealed with its message, so `get_messages` shows it and `search_messages` finds its words; asking again is free. It costs about $0.0005 a minute of audio, billed to the Cloudflare account. `TRANSCRIBE_MODEL` names another model if needed.
 
 **Reactions show up as replies.** A reaction appears at the time it was sent, as `[reacted 🙏 to "the message"]`. The owner's reaction counts as a reply; a customer's reaction is not a new message.
 
@@ -124,7 +124,7 @@ Workers Paid is required: the first history import needs more CPU than the free 
 | `list_notes` | Saved notes, soonest reminder first; filter by chat or day due. |
 | `update_note` | Mark a note done, change its text or reminder day, or delete it. |
 | `get_media` | Fetch the photo, voice note, video or document behind a message. |
-| `transcribe_audio` | Voice notes to text, kept with the message. Only with a Workers AI binding. |
+| `transcribe_audio` | Voice notes to text, kept with the message. Up to 20 per call. |
 | `unnamed_chats` | Chats known only by number, busiest first, with the last thing the other person said. |
 | `set_contact_names` | Save names for phone numbers. Names stick to the number, so they show in groups too. |
 | `sync_now` | Pull new messages right now. |
@@ -263,6 +263,8 @@ Durable Object SQLite bills rows read and written, and a write costs about a tho
 | `WA_PIN` | secret, optional | Turns on `/debug` with an `x-pin` header. 32+ characters. |
 | `TIMEZONE` | var | `Asia/Riyadh`. Wins over the zone saved at sign-up. |
 | `DEFAULT_COUNTRY_CODE` | var | `966`. For numbers saved without a country code. |
+| `AI` | Workers AI binding | Set. Turns on `transcribe_audio`. |
+| `TRANSCRIBE_MODEL` | var, optional | Unset, so `@cf/openai/whisper-large-v3-turbo`. |
 | `OAUTH_KV` | KV binding | Namespace named `WA_OAUTH_KV`; the binding name can't change because the OAuth library reads `env.OAUTH_KV`. |
 | `WA` | Durable Object | `WhatsAppStore`, one instance named `owner`. |
 | `REGISTRY` | Durable Object | `Registry`, upstream's seat counter; bound but unused here. |
