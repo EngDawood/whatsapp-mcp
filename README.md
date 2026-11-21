@@ -1,416 +1,301 @@
-> **Fork note.** This is EngDawood's copy of [finereli/whatsapp-mcp](https://github.com/finereli/whatsapp-mcp) (MIT), run in single-user mode on its own Cloudflare account. Imported as a single commit from upstream `b49d494`; to bring in later upstream fixes, compare against `upstream/main` and port them. The upstream author's encrypted deploy files (`secrets/`, `CLAUDE.md`) were removed. Everything below is the upstream README.
-
-> **Additions in this fork.**
-> - **Chat viewer at `/chats`:** a read-only, WhatsApp-style view of your stored history in the browser. It has the chat list, conversations with replies, inline photos and voice notes, search across every message, and a "Waiting on me" tab. It uses the dashboard sign-in (14-day cookie), so anyone holding that browser session can read your messages. Sign out on shared machines.
-> - **New MCP tools:** `get_context` (the messages around a search hit) and `chat_activity` (who talked how much over a period, without decrypting message text).
-> - **Clearer tool output:** replies show what they quote (for messages stored from now on), search hits carry their id, and `get_messages` / `search_messages` say when more results exist and how to page to them.
-
 # whatsapp-mcp
 
-<a href="https://hackergit.org/r/finereli/whatsapp-mcp"><img src="https://hackergit.org/badge/finereli/whatsapp-mcp.svg?style=rank" alt="Hacker News" height="55"></a>
+A read-only MCP server over my WhatsApp Business chats. It runs on my Cloudflare Workers Paid account at `https://whatsapp-mcp.engdawood.workers.dev`, and my assistants (Meta Muse, Claude) use it for an end-of-day summary, reminders about customers waiting on a reply, and notes about customers.
 
-Connect ChatGPT, Claude or Grok to your WhatsApp. It is a read-only MCP server over your own message history, stored encrypted, and open source.
-
-You link your phone once, the way you'd link WhatsApp Web, and from then on any MCP client can search and read your chats. It can't send anything.
-
-Built by [@finereli](https://x.com/finereli). Questions and bug reports go in an issue here, or to me on X.
-
-There are two ways to use it:
-
-- **Use it at [whatsapp.finereli.com](https://whatsapp.finereli.com).** This is the quick way. Sign in with Google, scan the QR code with your phone, and add `https://whatsapp.finereli.com/mcp` to your agent. It's a free beta with a limited number of seats and a size limit per account. Your messages are encrypted at rest, but I run the login service, so in principle I could derive your key. "What it guarantees" below says exactly what that means. If you'd rather not trust me, run your own copy.
-- **Run your own copy** in your Cloudflare account. This is what the setup guide below covers. Free apart from Cloudflare's few dollars a month, and the key comes from a password only you know. Anyone can also run it as a service for other people: see "Running it for other people".
-
-The easiest way to set up the hosted version is to let your agent do it. Paste this into Claude, ChatGPT or Grok:
-
-> Set up WhatsApp for me via https://whatsapp.finereli.com. Read https://whatsapp.finereli.com/llms.txt and walk me through it.
-
-Ask your agent things like:
-
-- "What did Dana say about the flights?"
-- "Find every message where someone mentioned the lease, across all my chats."
-- "Summarize what I missed in the family group this week."
+The server is a linked device, like WhatsApp Web. It reads and searches the history and keeps notes on its own side. It cannot send, mark as read, edit or delete anything on WhatsApp.
 
 ## How it works
 
-Your phone stays the source of truth. The server is a linked device that your agent talks to.
+The phone stays the source of truth. The server does not stay connected to WhatsApp: when an assistant reads and the stored copy is more than 30 minutes old, it logs in, collects whatever WhatsApp queued since last time, writes it to its own database and disconnects after a few quiet seconds (60 seconds at most). The web page's refresh button uses a 5-minute window, and `sync_now` pulls on demand. The windows are long on purpose: each pull is a fresh login from a Cloudflare IP, and fewer logins keep the business number's risk low.
 
-It doesn't stay connected to WhatsApp. When your agent asks for something, it connects, collects whatever WhatsApp queued for it since last time, writes that to its own database, and hangs up. Your phone keeps working normally and keeps getting notifications.
-
-Your messages live in a SQLite database inside a Durable Object in Cloudflare, one per person, sealed with a key that comes from that person's sign-in.
+Everything lives in one Durable Object's SQLite database, sealed with a key that comes from my password. The session connects with `markOnlineOnConnect: false`, so the phone keeps showing notifications.
 
 ## What it guarantees, and what it doesn't
 
-**It only reads.** There are no tools that send, edit or delete anything in WhatsApp.
+**It only reads.** No tool sends, edits or deletes anything in WhatsApp.
 
-**Your messages are encrypted at rest. Whether the operator can read them depends on how it is run.**
-- **Your own copy** (`WA_OWNER_PASSWORD`): the key comes from your password. There is no master key and no recovery key. Not Cloudflare, and not someone who copies the database, can read your stored messages without it.
-- **A hosted service** (`OPEN_SIGNUP`): people sign in with Google through a login service (login.finereli.com) that hands the server a key for them, the same key every time. A leaked database, a stolen backup or a peek inside the hosting account shows noise. The login service's operator can derive that key, so the encryption is not a lock against them. They say so, the code is open source, and running your own copy removes the question.
-- Each account has a random data key. It encrypts everything you own: message text, chat and contact names, the names your agent saves, and WhatsApp's session keys.
-- The data key is stored only in a form locked by that password or login key (PBKDF2-SHA256, 600,000 rounds for a password, run as six chained passes of 100,000 because Cloudflare caps each call there, then AES-256-GCM). Someone who copies the database can't read your stored messages without it.
-- Phone numbers and chat ids are replaced by keyed hashes in the database, so it can still sort and group without knowing who anyone is. Timestamps, message types and which side sent each message are left readable, and so is roughly how long each message is. Someone with the database could see how many chats you have, how active they are and when, but not who they were with or what they said.
-- Search uses a filter per block of about 128 messages, built from keyed hashes of the words in it (see "Searching encrypted messages" below). Without your key it can't be tested for any word. What it shows is roughly how many different words a block holds.
-- Signing in produces the data key for a while. It travels inside the OAuth token your agent holds and your browser session, each encrypted under that token. The server stores nothing that can open your data on its own.
+**Stored data is encrypted at rest.**
+- The account has a random 32-byte data key. It seals everything I own: message text, chat and contact names, saved names, notes and WhatsApp's session keys.
+- The data key is stored only wrapped by my password (PBKDF2-SHA256, 600,000 rounds run as six chained passes of 100,000, then AES-256-GCM). There is no master key and no recovery key. Neither Cloudflare nor someone who copies the database can read it without the password.
+- Phone numbers and chat ids are replaced by keyed hashes, so the database can sort and group without knowing who anyone is. Timestamps, message types, which side sent each message and rough message lengths stay readable.
+- Search uses a keyed filter per block of about 128 messages (see "Searching encrypted messages"). Without the key it reveals only roughly how many distinct words a block holds.
+- After sign-in the data key travels inside the OAuth token the assistant holds and the browser session, each encrypted under that token. The server stores nothing that opens the data on its own.
 
-**It is not end-to-end encryption, and you should know exactly where that stops.**
-- While you or your agent are making a request, the server has your key in memory and works with your messages in plain text.
-- Whoever runs the server could deploy modified code that captures passwords as people type them, or reads the key as it arrives. The code is open source so that this can be checked, and you can run your own copy to remove the question.
-- Whatever your agent reads goes to the company that runs the agent.
-- The server is itself a WhatsApp device that has to read your messages to answer your agent, so it has to see them in plain text. A design that kept them hidden from the server couldn't search them for you.
+**It is not end-to-end encryption.**
+- While a request runs, the server has the key in memory and works with messages in plain text.
+- Whatever an assistant reads goes to the company that runs the assistant.
+- Files sent by customers can contain instructions aimed at the assistant (prompt injection). The server can't send anything, but other tools the assistant has can, so treat what is inside customer files as untrusted.
 
-**If you lose your password (own copy), you lose the stored copy.** Nobody can reset it. Your messages are still in WhatsApp, so you link again and import whatever history WhatsApp sends. Signing in with Google has no password to lose.
+**Lose the password and the stored copy is gone.** Nobody can reset it. The messages are still in WhatsApp: relink and import what WhatsApp sends.
 
-**You can delete everything.** "Delete my data" on the dashboard unlinks WhatsApp and erases your messages, names, keys and account, and disconnects every agent.
+**Delete everything.** "Delete my data" on the dashboard unlinks WhatsApp, erases messages, names, notes, keys and the account, and disconnects every assistant.
 
-**WhatsApp discourages this.** It uses the same protocol as WhatsApp Web through an open source library (Baileys), and WhatsApp's terms discourage that. WhatsApp could restrict or close an account that does it. The risk for a read-only linked device is low, but it isn't zero. Use it on your own account, and don't use it to send messages.
+**WhatsApp discourages this.** The server speaks the WhatsApp Web protocol through Baileys, an unofficial library, which WhatsApp's terms don't allow. Bans mostly hit sending (bulk, cold outreach, status uploads from servers); a read-only device that logs in rarely is in the lowest-risk group, but the risk is not zero and Meta publishes no thresholds. To keep it low:
+- Keep it read-only. Never add sending, read receipts or presence.
+- Keep logins rare (the 30-minute window above).
+- Relink only when needed; each QR pairing registers a new device.
+- Keep the phone online and the Business app updated. Linked devices are dropped after about 14 days without the phone.
+- Keep a chat backup on the phone.
 
-**The people in your chats didn't agree to this.** Their messages to you are in the copy too. It's your call whether you're comfortable with that.
+**The people in the chats didn't agree to this.** Their messages are in the copy too.
 
-## Run your own copy
+## Setup
 
-You need a Cloudflare account on the Workers Paid plan (see the note below), Node 20 or later, and your phone.
+What this deployment already has: a Workers Paid plan, the KV namespace, and the secrets. To redeploy from a fresh machine:
 
 ```sh
-git clone https://github.com/finereli/whatsapp-mcp
+git clone https://github.com/EngDawood/whatsapp-mcp
 cd whatsapp-mcp
-npm install
-
-# 1. A place for the sign-in tokens. Paste the id it prints into wrangler.jsonc.
-npx wrangler kv namespace create WA_OAUTH_KV
-
-# 2. A password for your account. 12+ characters. This is what locks your messages.
-npx wrangler secret put WA_OWNER_PASSWORD
-
-# 3. Deploy.
+npm ci            # not npm install: postinstall patches the pinned Baileys bridge
 npm run deploy
 ```
 
-Wrangler prints your URL, something like `https://whatsapp-mcp.your-name.workers.dev`. Open it. The front page has the two remaining steps:
-
-1. **Link WhatsApp.** Sign in with the password, then scan the QR code with WhatsApp (Settings, Linked Devices, Link a Device). If you're on the phone itself and can't scan a screen, use the phone number option instead. The first link imports your history. The page shows progress, and you can close it.
-2. **Connect your agent.** Point your MCP client at `https://your-url/mcp` and sign in with the password when it asks. In Claude Code:
-
-   ```sh
-   claude mcp add --transport http whatsapp https://your-url/mcp
-   ```
-
-   Then type `/mcp`. ChatGPT calls an MCP server a connector; Grok and anything else that speaks MCP works the same way.
-
-   The front page also has Claude, ChatGPT and Grok buttons. Each copies a message ("Set up WhatsApp for me via your-url. Read your-url/llms.txt and walk me through it.") and opens the assistant, so you paste it there. `/llms.txt` is a plain-text page written for the assistant: where the MCP endpoint is, the steps the person has to do themselves, and what to tell them honestly.
-
-The first sign-in with `WA_OWNER_PASSWORD` creates your account. After that your account's own password is what counts, so changing the secret later does nothing. If you want your own domain, see the comments at the bottom of `wrangler.jsonc`.
-
-### Run it with Docker
-
-The same Worker runs on your own machine under workerd, Cloudflare's open source runtime, through `wrangler dev`. Durable Objects and KV become SQLite files in `./data`, and there is no CPU limit, so a big first import isn't a problem. You need Docker and a way to reach it over https: a Cloudflare Tunnel, Caddy, Traefik, anything that terminates TLS.
+From scratch on a new account:
 
 ```sh
-git clone https://github.com/finereli/whatsapp-mcp
-cd whatsapp-mcp
-cp .env.example .env    # set PUBLIC_HOST and WA_OWNER_PASSWORD
-docker compose up -d --build
+# 1. A store for sign-in tokens. Put the id it prints into wrangler.jsonc (binding stays OAUTH_KV).
+npx wrangler kv namespace create WA_OAUTH_KV
+
+# 2. The password that locks the data. 12+ characters.
+npx wrangler secret put WA_OWNER_PASSWORD
+
+# 3. Optional: 32+ random characters to turn on /debug.
+npx wrangler secret put WA_PIN
+
+# 4. Deploy.
+npm run deploy
 ```
 
-Point your tunnel or proxy at the published port (`127.0.0.1:8787` by default; `BIND` and `PORT` in `.env` change it) for `PUBLIC_HOST`, then carry on from step 1 above with `https://PUBLIC_HOST`. The Worker builds every URL it hands out, OAuth ones included, from `PUBLIC_HOST`, so it has to be the name clients use.
+Then:
 
-Things that differ from Cloudflare:
-- `./data` is everything: messages, the WhatsApp session, agents' tokens. Back it up together with `.env`; without the password the backup can't be read, and without the backup there is nothing to read.
-- `wrangler dev` is a development server. It holds up fine for one person, but there is no fleet behind it: if the machine is down, so is your agent's WhatsApp.
-- Set `WA_PIN` in `.env` to use `/debug` (`curl -H "x-pin: $WA_PIN" http://127.0.0.1:8787/debug`), which shows the pairing log when a link fails.
+1. **Link WhatsApp.** Open the Worker URL, sign in with the password, and scan the QR code from WhatsApp (Settings, Linked Devices, Link a Device). On the phone itself, use the phone number option instead. The first link imports history; the page shows progress and can be closed.
+2. **Connect an assistant.** Point the MCP client at `https://whatsapp-mcp.engdawood.workers.dev/mcp` and sign in with the password when asked. In Claude Code:
 
-### The Workers Paid note
+   ```sh
+   claude mcp add --transport http whatsapp https://whatsapp-mcp.engdawood.workers.dev/mcp
+   ```
 
-Importing a large history decodes a lot of data in one go, and the default CPU limit on Workers is too small for it. `wrangler.jsonc` raises it, and raising it needs the paid plan, which is $5 a month. I haven't tried the free plan. If you're on it, remove the `limits` block and expect the first import to be fragile.
+   `/llms.txt` is a plain-text page written for assistants: where the endpoint is and what the person has to do.
 
-### Upgrading from an earlier version
+The first sign-in with `WA_OWNER_PASSWORD` creates the account. After that the account's own password counts, so changing the secret later does nothing.
 
-The first version stored messages in plain text. The first sign-in after you deploy this one encrypts everything already stored, in one step that either completes or changes nothing. Sign in with `WA_OWNER_PASSWORD`; that password becomes the one that locks your data. The Google login option is gone, because a key can't be made from a login service. The daily background pull is gone too, for the reason in the next section.
+Workers Paid is required: the first history import needs more CPU than the free plan allows, and `wrangler.jsonc` raises `cpu_ms` to 300,000.
 
 ## Things to know
 
-**Syncing happens when your agent asks.** There is no scheduled pull, because the data key only exists while someone is signed in, and a background job would have nothing to decrypt with. Every read tool first tops up from WhatsApp if the stored copy is more than ten minutes old, so you notice nothing day to day. WhatsApp queues messages for a linked device for a limited time. An account nobody uses for weeks may have lost the messages WhatsApp was holding for it, and would need a full resync: link the phone again and import what WhatsApp sends. That's the price of never keeping a key on the server.
+**Syncing happens when an assistant asks.** There is no scheduled pull, because the data key only exists while someone is signed in. WhatsApp queues messages for a linked device for a limited time, so a server nobody uses for weeks may need a relink and re-import.
 
-**Search reads a block per match, not the whole history.** The messages are encrypted, so the database can't search them, but each block of about 128 messages carries a small keyed filter that says which words it can't contain. A search skips every block its words rule out, and decrypts only the rest. The first search on an account from before this builds the filters, which costs about what one search used to: a full decrypt, once. Several queries still share one pass, so `search_messages` takes a list: agents should put every search they need in one call.
+**Search reads a block per match, not the whole history.** Each block of about 128 messages carries a keyed filter of the words it can't contain, and a search decrypts only the blocks that might match. Several queries share one pass, so `search_messages` takes a list.
 
-**Search is exact words.** Words match whole (case and accents ignored), several words must all appear, "quoted words" must appear together in order, and a trailing `*` matches word starts (`flight*`). It isn't fuzzy, and it doesn't stem.
+**Search is exact words.** Whole words, case and accents ignored. Arabic is matched the way people write it: diacritics and tatweel dropped, أ إ آ as ا, ى as ي, ة as ه, Arabic-Indic digits as 0-9, and the prefixes ال, بال, كال and لل stripped, so الطلب and طلب find each other. Several words must all appear, "quoted words" must appear together in order, and a trailing `*` matches word starts. Not fuzzy, no stemming.
 
-**You get what WhatsApp sends.** The first link imports whatever history WhatsApp decides to hand a new device. It may not be everything. It only does this once per link. To import again, relink (your stored messages are kept, and a re-import fills in anything missing).
+**You get what WhatsApp sends.** The first link imports whatever history WhatsApp hands a new device, once per link. Relinking keeps stored messages and fills in what is missing.
 
-**Some chats show up as phone numbers.** WhatsApp doesn't give a linked device every contact name, and most of these are one-off messages from people you never saved. For the ones that matter, your agent can fix it: it lists the unnamed chats, looks the numbers up in your contacts with whatever contacts tool it already has (a Google Contacts or Gmail connector, for example), and saves the names. The server never connects to a contacts service itself. See "Naming chats" below.
+**Some chats show as phone numbers.** WhatsApp doesn't give a linked device every contact name. Ask the assistant to find names for unnamed chats: it calls `unnamed_chats`, matches the numbers against contacts with a tool it already has, and saves them with `set_contact_names`. The server never connects to a contacts service itself.
 
-**Media is fetched when asked for.** Photos, voice notes and documents appear as labels like `[image]` or `[voice note 12s]`, with the caption if there was one and a media id. `get_media` fetches the file from WhatsApp and hands it to the agent; nothing is stored but what it takes to fetch it again. WhatsApp keeps files for a few weeks, and after that the phone is asked to upload the file again, which works while it's online and still has it. Messages stored before this was added have no download details until you relink.
+**Media is fetched when asked for, never stored.** Photos, voice notes, videos, documents and stickers appear as labels with a media id. `get_media` downloads the encrypted file from WhatsApp's CDN, decrypts it in memory and hands it to the assistant; only what it takes to fetch it again is kept. Files over 10 MB are refused. WhatsApp keeps files for a few weeks; after that the phone is asked to upload the file again, which works while it is online and still has it.
 
-**Voice notes can be transcribed.** With a Workers AI binding (`"ai": { "binding": "AI" }` in `wrangler.jsonc`), `transcribe_audio` runs voice notes through Whisper on Cloudflare. A transcript is kept with its message, so `get_messages` shows it and `search_messages` finds its words. It costs about $0.0005 a minute of audio, billed to your Cloudflare account. Under Docker the binding still calls Cloudflare, so it needs `wrangler login`; without it, leave transcription off.
+**Voice notes can be transcribed.** `transcribe_audio` runs voice notes through Whisper (`@cf/openai/whisper-large-v3-turbo`, language detected automatically) on Workers AI, through the `AI` binding in `wrangler.jsonc`. The audio goes to Cloudflare's model and nowhere else, and only when an assistant asks. A transcript is kept sealed with its message, so `get_messages` shows it and `search_messages` finds its words; asking again is free. It costs about $0.0005 a minute of audio, billed to the Cloudflare account. `TRANSCRIBE_MODEL` names another model if needed.
 
-**Reactions show up as replies.** A 🙏 on a message appears in the chat at the time it was sent, as `[reacted 🙏 to "the message"]`, from whoever sent it. Changing a reaction replaces it, and taking it back removes it. Reactions from before this was added were never stored, so they only appear for older messages if you relink and re-import.
+**Reactions show up as replies.** A reaction appears at the time it was sent, as `[reacted 🙏 to "the message"]`. The owner's reaction counts as a reply; a customer's reaction is not a new message.
 
-**Relinking.** If your phone says the device was removed, or you want to start over, ask your agent to run `relink`, or open `/setup` and choose "Unlink and scan again". You scan a new QR code. Stored messages are kept.
+**Notes and reminders.** `save_note` keeps a sealed note on a chat, optionally with a day to be reminded. Due reminders show in `daily_digest` and `get_messages`. Nothing goes to WhatsApp.
 
-## Running it for other people
+**Time.** All times are `Asia/Riyadh` (`TIMEZONE`), which wins over the zone saved at sign-up. Numbers saved without a country code get `966` (`DEFAULT_COUNTRY_CODE`).
 
-The same code runs as a service for many people. Leave `WA_OWNER_PASSWORD` unset and set `OPEN_SIGNUP=true`. With neither set, nobody can sign in, so a deployment that forgot to choose can't become a free service for strangers. People sign in with Google through a login service (login.finereli.com by default; point `LOGIN_URL` at your own). The service says who they are and gives the server a data key for them, derived from a secret only the service holds, so there is no password to type or lose. The server keeps an anonymous id made from their Google account id, never their email. Each person gets their own Durable Object, their own key, and no way to see anyone else's data. The honest limit: whoever runs the login service can derive every key, so say so to your users, and know that this protects against leaks, not against you.
+**Relinking.** If the phone says the device was removed, ask the assistant to run `relink`, or open `/setup` and choose "Unlink and scan again". Stored messages are kept.
 
-The login service has to list your origin in its `ALLOWED_ORIGINS`, and it must return a key from `/exchange` when asked (`{code, key: true}`). Writing your own is small: the key is `HKDF-SHA256(secret, salt = your origin, info = the person's Google id)`, returned only to a server (never a browser), and the secret must never change.
+## Chat viewer
 
-```sh
-# in wrangler.jsonc vars: "OPEN_SIGNUP": "true", "SIGNUP_LIMIT": "100", and "LOGIN_URL" if not finereli's
-```
+`/chats` is a read-only, WhatsApp-style view of the stored history in the browser: the chat list, conversations with replies, inline photos and voice notes, search across every message, and a "Waiting on me" tab. It uses the dashboard sign-in, a 14-day cookie, so anyone holding that browser session can read the messages. Sign out on shared machines.
 
-Set `OPERATOR_NAME` so the privacy policy and terms say who runs it. Those pages describe what this code does, and their wording is not legal advice: have someone qualified read them before you offer this to the public.
-
-### Caps, and getting told when you hit them
-
-A service for strangers needs limits, so there are three, all optional variables:
-
-- `SIGNUP_LIMIT`: the most accounts. When it's reached, signup shows a "full for now" page with your contact. Deleting an account gives its seat back.
-- `MAX_MESSAGES` and `MAX_DB_MB`: the most one account can hold. They default to 250,000 messages and 300 MB in many-user mode, and `0` turns one off. A history that's too big when first linked is turned away: the phone is unlinked, everything received is deleted, and the person is told why and where to reach you. An account that grows past the cap later keeps what it has and stops adding new messages.
-- `CONTACT_X`: your X handle, shown on those pages, in the terms and privacy policy, and in what an agent says when an account is full or turned away.
-
-To hear when seats run out, turn on [Email Routing](https://developers.cloudflare.com/email-routing/) for your domain, verify your address there, and add a `send_email` binding named `ALERT_EMAIL` with that address as `destination_address`, plus the vars `ALERT_TO` (the same address) and `ALERT_FROM` (any address on your domain). You get an email at 80 percent of `SIGNUP_LIMIT` and another when it's full. Messages contain counts and nothing about anyone.
-
-When every seat is taken, the front page says so and offers a waitlist instead of a signup. The list is at `/debug?u=waitlist` (needs WA_PIN); `POST /debug?u=waitlist&remove=<email>` takes someone off it. With a daily cron trigger, the seat and waitlist counts are written to the log once a day.
-
-What it costs, from Cloudflare's published prices (estimates, not measured on a real fleet):
-
-| Item | Price | Per person, per month |
-| --- | --- | --- |
-| Workers Paid plan | $5 flat per account, shared by everyone | close to nothing once there are a few people |
-| Stored data | $0.20 per GB, 5 GB included | a heavy history is 100 to 300 MB: 2 to 6 cents |
-| Compute and Durable Object time | included allowances are large | under a cent |
-| First import | a few minutes of CPU, once | under a cent |
-
-With the default caps, 100 people is about $10 a month at the absolute worst (everyone at the storage cap, which won't happen), and more likely $5 to $7. Cloudflare isn't the cost that matters. Support time is, and so is the risk below.
-
-The risk to weigh: every linked device connects from Cloudflare's datacenter addresses, and WhatsApp may flag that more readily than a phone's. If it restricts accounts, the people who signed up are the ones who lose. Say so plainly to anyone you invite. The terms of service and privacy policy already do.
-
-## What your agent can do
+## Tools
 
 | Tool | What it does |
 | --- | --- |
 | `list_chats` | Chats, most recent first. Filter by name or number. |
-| `get_messages` | Read one chat. Page back or forward by date. |
-| `search_messages` | Search across everything, or within one chat. Takes a list of queries and answers them in one pass. |
-| `get_context` | The messages just before and after one message, e.g. a search hit. Search hits show the id it takes. |
-| `chat_activity` | Who talked how much over a period: busiest chats, or busiest people in one chat. Counts only. |
-| `unanswered_chats` | Direct chats where the other person wrote last and you haven't replied. |
-| `daily_digest` | One day (or up to 7) in one call, for an end-of-day summary: reminders due, per chat messages in and out and open notes, who is still waiting on a reply and since when, and chats still waiting from earlier days. Days follow `TIMEZONE`. |
-| `save_note` | Remember something about a customer or a follow-up, optionally with a day to be reminded (`remind_on`). Stored encrypted, like messages. Nothing goes to WhatsApp. |
-| `list_notes` | Saved notes, reminders soonest first; filter by chat or by day due. |
+| `get_messages` | Read one chat. Page back or forward by date or cursor. |
+| `search_messages` | Search across everything or one chat. Takes a list of queries and answers them in one pass. |
+| `get_context` | The messages just before and after one message, e.g. a search hit. |
+| `chat_activity` | Who talked how much over a period (default 7 days): busiest chats, or busiest people in one chat. Counts only. |
+| `unanswered_chats` | Direct chats where the customer wrote last and hasn't had a reply (default 14 days). Groups never wait. |
+| `daily_digest` | One day (or up to 7) in one call for an end-of-day summary: reminders due, per-chat messages in and out with open notes, who is still waiting and since when. |
+| `save_note` | Remember something about a customer, optionally with a reminder day (`remind_on`). |
+| `list_notes` | Saved notes, soonest reminder first; filter by chat or day due. |
 | `update_note` | Mark a note done, change its text or reminder day, or delete it. |
 | `get_media` | Fetch the photo, voice note, video or document behind a message. |
-| `transcribe_audio` | Voice notes to text, kept with the message. Only with a Workers AI binding. |
-| `unnamed_chats` | Chats known only by phone number, busiest first, with the last thing the other person said. |
-| `set_contact_names` | Save names for phone numbers, in any format. Names stick to the number, so they also show up in groups. |
+| `transcribe_audio` | Voice notes to text, kept with the message. Up to 20 per call. |
+| `unnamed_chats` | Chats known only by number, busiest first, with the last thing the other person said. |
+| `set_contact_names` | Save names for phone numbers. Names stick to the number, so they show in groups too. |
 | `sync_now` | Pull new messages right now. |
 | `link_status` | Is it linked, when did it last pull, how much is stored. |
-| `relink` | Unlink and start over. A human has to scan the new QR code. |
+| `relink` | Unlink and start over. A human scans the new QR code. |
 
-## Naming chats
-
-WhatsApp only gives this server the names it knows. The rest show up as phone numbers. Rather than have the server log in to a contacts service (which means a cloud project, consent screens and, for Google, an app review), it hands the job to your agent, which usually already has a way to reach your contacts.
-
-Say "find names for my unnamed chats". The agent calls `unnamed_chats`, matches the numbers against your contacts, and saves what it finds with `set_contact_names`. It won't find everyone: most unnamed chats are a single message from a stranger.
-
-Agents get nudged toward this on their own. The server's instructions mention it, and so does every "no chat found" and "no matches" result, because that's the moment an agent is stuck on a name. `link_status` also says how many chats are unnamed.
+The MCP `instructions` string and each tool's `description` in `src/mcp/server.ts` are what assistants read to choose a tool. Change them there when a tool changes.
 
 ---
 
-# For agents, and people adapting this
+# For agents, and anyone changing the code
 
-Everything below is for whoever is changing the code, including an AI agent working on a fork. The top of this file is for the person who owns the deployment.
+`AGENTS.md` holds the rules every change must keep (read-only, single-user, everything sealed, no content in logs) and where each piece of shared behaviour lives. Read it first. This part explains how the code works.
 
 ## Shape of the thing
 
 ```
 MCP client ──OAuth──> Worker (src/index.ts)
-                        ├─ /mcp ───────────> mcp.ts: tools, one fresh McpServer per request
-                        └─ /, /setup, /authorize, /login, /auth/callback, /pair/*   (landing, sign-in, pairing UI)
-                                   │ RPC: unlock(dek), then the call
+                        ├─ /mcp ──────> src/mcp/server.ts: tools, one McpServer per request
+                        └─ /, /setup, /login, /authorize, /chats, /api/*, /pair/*, /debug  (src/web/routes.ts)
+                                   │ RPC: open(key), then the call
                                    v
-              WhatsAppStore (Durable Object, one instance per person)
-                ├─ SQLite: sealed auth keys, messages, chats, contacts
-                └─ Baileys socket, opened only during a session (pairing or pull)
+              WhatsAppStore (Durable Object, src/whatsapp/whatsapp-do.ts, named "owner")
+                ├─ keyless: account record, login throttling, flags
+                └─ Account (src/whatsapp/account.ts), only from open(key)
+                     ├─ SQLite: sealed auth keys, messages, chats, contacts, notes
+                     └─ Baileys socket, opened only during a session (pairing or pull)
                                    │ WebSocket
                                    v
                               WhatsApp servers
 ```
 
-One Durable Object per person holds everything. Its SQLite is both the Baileys auth store and the message store. The object is named `owner` in single-user mode and by a hash of the Google account id otherwise, so finding someone's object needs no directory. The Worker is stateless apart from a KV namespace: the OAuth provider's tokens, short-lived "pending sign-in" records, and browser sessions.
+The Worker is stateless apart from the KV namespace (OAuth tokens, pending sign-ins, browser sessions). `src/history/history.ts` is the reader both front ends (MCP tools and the web chat API) use, so read rules are decided once.
 
 ## How the key travels
 
-`vault.ts` is the only code that touches keys. Read it first.
+`src/account/vault.ts` is the only code that touches keys.
 
-1. **Signup or first sign-in.** `createAccount` makes a random 32-byte data key (DEK), stretches the password (or, for a login-service key, which is already random, not at all: `KEY_STRETCH`) with PBKDF2 into a key-encryption key and an auth key, wraps the DEK under the first and stores a hash of the second as a verifier. The account record (salt, rounds, verifier, wrapped DEK) goes in the person's Durable Object. It's useless without the password.
-2. **Sign-in.** `openAccount` checks the verifier and unwraps the DEK. Wrong passwords are throttled in the object (`noteLogin`): five in a row, then longer and longer waits. A missing account spends the same time as a wrong password. With the login service there is no password: `signInWithLogin` redeems the one-time code at the service, which returns the person's id and key, and opens or creates the account.
-3. **Carrying it.** The DEK goes into the OAuth grant's `props`, which `workers-oauth-provider` encrypts under a key wrapped by each access and refresh token. The browser gets a session: a random token filed in KV with the DEK sealed under a key derived from the token, so KV alone can't open it. The dashboard uses a second 30 minute token minted from the cookie.
-4. **Using it.** Every Worker to Durable Object call starts with `unlockedStub()`, which calls `unlock(dek)`. The object builds a `Vault`, checks it against a sealed canary in `meta` so a wrong key is refused, and keeps the key in memory only. It's gone when the object is evicted. Nothing writes it to disk or to logs.
-5. **Sealing.** `Vault.seal` is AES-256-GCM with a random nonce and an `aad` label naming what the blob is, so one kind can't be passed off as another. `Vault.pid` is an HMAC that turns a jid into an opaque, stable id.
+1. **First sign-in.** `createAccount` makes a random data key, stretches the password with PBKDF2 into a key-encryption key and an auth key, wraps the data key under the first and stores a hash of the second as a verifier.
+2. **Sign-in.** `openAccount` checks the verifier and unwraps the data key. Wrong passwords are throttled in the Durable Object: five in a row, then longer waits. A missing account spends the same time as a wrong password.
+3. **Carrying it.** The data key goes into the OAuth grant's `props`, which `@cloudflare/workers-oauth-provider` encrypts under each token. The browser gets a random session token filed in KV with the data key sealed under a key derived from the token, so KV alone can't open it.
+4. **Using it.** Each call opens the account with `open(key)`, which checks the key against a sealed canary and returns an `Account`. There is no "locked" mode: anything that needs the key lives on `Account`. The key is kept in memory only.
+5. **Sealing.** `Vault.seal` is AES-256-GCM with a random nonce and an AAD letter naming what the blob is. `Vault.pid` is an HMAC that turns a jid into an opaque, stable id.
 
-Don't log a key, put one in a URL, or store one anywhere that outlives a session. Don't add a table that holds anything personal in a readable column.
+Don't log a key, put one in a URL, or store one anywhere that outlives a session.
 
 ## Files
 
 | File | Job |
 | --- | --- |
-| `src/index.ts` | Entry point. The `Env` bindings, OAuth provider wiring (`/mcp` goes to the MCP server, everything else to `web/routes.ts`), the daily stats log. |
+| `src/index.ts` | Entry point: `Env` bindings, OAuth provider wiring (`/mcp` to the MCP server, the rest to `web/routes.ts`). |
 | `src/account/vault.ts` | Keys: password to account record, sealing and opening, pseudonymous ids, tokens that carry a key. |
-| `src/account/auth.ts` | Accounts and sessions. Single-user mode or many-user mode, password sign-in and the login service, the KV-backed sessions that carry the key, `unlockAccount`. |
-| `src/account/limits.ts` | The mode (one person, many, not set up) and the per-account size caps: what is over, and whether to turn an account away or stop adding to it. |
-| `src/account/registry.ts` | The seat counter behind `SIGNUP_LIMIT`, and the waitlist. |
-| `src/account/notify.ts` | Emails the operator through the `ALERT_EMAIL` binding. |
-| `src/whatsapp/whatsapp-do.ts` | The Durable Object, keyless part: the account record, login throttling, flags. `open(key)` checks the key and returns the open `Account`. |
-| `src/whatsapp/account.ts` | The open `Account` (an RPC target): everything that needs the key. Baileys sessions (pull, pairing), media, transcripts, and `history()` for the store. |
-| `src/whatsapp/translate.ts` | WhatsApp's message format to plain events (message, reaction, edit, delete): content types, captions, media keys, quoted replies. Pure. |
-| `src/whatsapp/auth-state.ts` | Baileys auth state backed by the DO's SQLite and sealed (replaces `useMultiFileAuthState`). |
-| `src/whatsapp/media.ts`, `src/whatsapp/transcribe.ts` | Downloading and decrypting files from WhatsApp's CDN; voice notes to text on Workers AI. |
+| `src/account/auth.ts` | Sign-in and the KV-backed sessions that carry the key. |
+| `src/account/limits.ts`, `registry.ts`, `notify.ts` | Mode detection and the upstream multi-user code (caps, seats, alert email). Off in this deployment. |
+| `src/whatsapp/whatsapp-do.ts` | The Durable Object, keyless part. `open(key)` returns the `Account`. |
+| `src/whatsapp/account.ts` | The open `Account`: Baileys sessions (`runSession`, `pull`, `pullIfStale`, pairing), media, transcripts, logout. |
+| `src/whatsapp/translate.ts` | WhatsApp's wire format to plain events (message, reaction, edit, delete), media refs, quoted replies. Pure. New message kinds go here. |
+| `src/whatsapp/auth-state.ts` | Baileys auth state on the Durable Object's SQLite, sealed. |
+| `src/whatsapp/media.ts`, `transcribe.ts` | Download and decrypt files from WhatsApp's CDN; voice notes to text on Workers AI. |
 | `src/whatsapp/phone.ts` | Phone numbers in any format to WhatsApp jids. |
-| `src/store/store.ts` | Schema, applying events to SQLite, every query, search, notes, and the migration from the plaintext version. |
-| `src/store/names.ts` | Who a chat or person is: one ranking for chat and sender names, placeholders, number format. |
-| `src/store/search-index.ts` | The keyed Bloom filters that let search skip blocks it can't match. |
-| `src/history/history.ts` | The History reader: the read rules both front ends share (which chat a name means, when to pull, default windows, paging cursors, dates). |
-| `src/history/connect.ts`, `src/history/zone.ts` | Opening an account behind a reader for one request; day windows in the owner's time zone. |
-| `src/mcp/server.ts` | The MCP tools (an adapter over the reader), and the hint that points agents at the naming tools. |
-| `src/web/routes.ts` | Pages and sign-in, the waitlist, `/debug`. `pair-api.ts` is the pairing calls, `chats-api.ts` the chat viewer's calls, `guard.ts` who is asking. |
-| `src/web/chats-page.ts` | The read-only chat viewer at `/chats`. |
-| `src/web/pages.ts`, `landing.ts`, `privacy.ts`, `tos.ts`, `ui.ts`, `brand.ts`, `http.ts`, `seats.ts` | All HTML and the bits around it. `ui.ts` has the shared design tokens. |
-| `src/platform/ws-shim.ts`, `lru-shim.ts`, `polyfills.ts` | Make Baileys run on workerd. See below. |
-| `scripts/vendor-bridge.mjs` | Extracts the wasm from Baileys' Rust bridge. Runs on `npm install`. |
-| `scripts/pull-config.mjs` | Rebuilds `wrangler.local.jsonc` from the live Worker. |
-| `Dockerfile`, `compose.yml`, `docker/entrypoint.sh` | Running it under `wrangler dev` on your own machine. |
-| `local-export/` | A separate one-off script that dumps your history to JSON files with no server. Not part of the deployment. |
+| `src/store/store.ts` | Schema, applying events, every query, search, notes, `unanswered` and `digest`, the legacy migration. |
+| `src/store/names.ts` | Who a chat or sender is: one ranking, returns `{ name, numberOnly }`. |
+| `src/store/search-index.ts` | Word folding (`fold`, `core`, Arabic normalisation) and the keyed Bloom filters. |
+| `src/history/history.ts` | The reader: which chat a name means, when to pull (`FRESH`), default windows (`WINDOW`), paging cursors. |
+| `src/history/connect.ts`, `zone.ts` | Opening an account behind a reader for one request; day windows in `TIMEZONE`. |
+| `src/mcp/server.ts` | The MCP tools and the `instructions` string assistants read. |
+| `src/web/routes.ts`, `pair-api.ts`, `chats-api.ts`, `guard.ts` | Pages and sign-in, the pairing calls, the chat viewer's API, who is asking. |
+| `src/web/chats-page.ts` | The chat viewer at `/chats`. |
+| `src/web/pages.ts`, `landing.ts`, `privacy.ts`, `tos.ts`, `ui.ts`, `brand.ts`, `http.ts`, `seats.ts` | HTML and helpers. `ui.ts` has the shared design tokens. |
+| `src/platform/ws-shim.ts`, `lru-shim.ts`, `polyfills.ts` | Make Baileys run on workerd. |
+| `scripts/vendor-bridge.mjs` | Extracts the wasm from Baileys' Rust bridge and patches its loader. Runs on `npm ci`. |
+| `scripts/pull-config.mjs` | Rebuilds a config from the live Worker (writes `wrangler.local.jsonc`; this fork keeps its real config in `wrangler.jsonc`). |
+| `test/*.test.mts` | Tests on `node:sqlite`; `test/ts-resolve.mjs` shims `cloudflare:workers`. |
+| `Dockerfile`, `compose.yml`, `docker/`, `local-export/` | Upstream's self-hosting and export extras. Not used by this deployment. |
 
 ## How sessions work
 
-All WhatsApp traffic happens inside `runSession()` in `whatsapp-do.ts`. There are two kinds:
+All WhatsApp traffic happens inside `runSession()` in `src/whatsapp/account.ts`:
 
-- **Pairing** (`startPairing`). No credentials yet. Baileys emits QR strings, kept in memory and rendered to SVG by `pairStatus()`. After a scan WhatsApp closes the socket with code 515 (restart required), and the session reconnects with the new credentials. History arrives as `messaging-history.set` chunks with a `progress` percentage. The session ends when WhatsApp reports 100 percent and the stream has been quiet for a few seconds.
-- **Pull** (`pull`). Reconnects with stored credentials. WhatsApp delivers whatever it queued while we were away, then signals `receivedPendingNotifications`. The session ends after a few quiet seconds.
+- **Pairing** (`startPairing`, `requestPairingCode`). Baileys emits QR strings, rendered to SVG for the setup page. After a scan WhatsApp closes the socket with code 515 and the session reconnects with the new credentials. History arrives as `messaging-history.set` chunks with a progress percentage. The session ends at 100 percent plus a few quiet seconds. A Durable Object alarm keeps the object alive while it runs, so closing the page doesn't stop the import.
+- **Pull** (`pull`, `pullIfStale`). Reconnects with stored credentials, receives what WhatsApp queued, and ends after 4 quiet seconds or 60 seconds in all.
 
-Callers share one session: a second `pull()` while one is running gets the same promise.
-
-A pairing session outlives the HTTP request that started it. `startPairing` sets a Durable Object alarm, and `alarm()` awaits the session promise. An in-flight alarm handler is what keeps the object alive. The pairing page only watches; closing it doesn't stop the import.
-
-Idle detection counts only data events (`messaging-history.set`, `messages.upsert`), not connection chatter. Counting everything keeps a session open forever, because presence and contact updates never stop.
+Callers share one session. Idle detection counts only data events (`messaging-history.set`, `messages.upsert`), because presence and contact updates never stop.
 
 ## Data model
 
-All in the Durable Object's SQLite (`store.ts`). "Sealed" means a `Vault.seal` blob; "pid" means a `Vault.pid` id.
+All in the Durable Object's SQLite (`src/store/store.ts`). "Sealed" means a `Vault.seal` blob; "pid" means a `Vault.pid` id.
 
-- `messages(chat, id, ts, from_me, sender, type, data)`, primary key `(chat, id)`. `chat` and `sender` are pids. `data` is sealed `{ b: body, p: push name, s: sender jid }`. Media is a label in the body. Edits rewrite it; deletes set it to `[deleted]`.
-- `chats(cid, data)`, `contacts(cid, data)`, `custom_names(cid, data)`. `cid` is the pid of the jid, and the sealed record holds the jid and the names. Display names resolve in memory (`nameOf` in `store.ts`), from a decrypted snapshot of these small tables that is dropped whenever they change: WhatsApp's chat name, then WhatsApp's contact name, then a saved name, then WhatsApp's notify name, then the latest push name seen in the chat, then the number. `custom_names` is what `set_contact_names` writes.
-- `alias(cid, data)`. WhatsApp is moving to anonymous `@lid` identifiers. This maps them to phone-number JIDs, and `addAlias` folds existing rows into the phone-number form so one person is one chat.
-- `auth(k, data)`. Baileys credentials and signal keys, with the key name hashed too, since `session-<number>.0` names a contact.
-- `meta(k, v)`, in the clear: `last_pull`, `paired`, `tz`, login throttling, a sealed canary, `schema`, `search_index`. `account(k, v)` holds the account record.
-- `chat_stats(chat, n, last)`: each chat's message count and newest timestamp, kept by triggers on `messages`, so counting never scans. Any new write to `messages` gets this for free; don't use `INSERT OR REPLACE` on it, because a replace removes the old row without running delete triggers.
-- `lid_senders(sender)`: senders stored under an unmapped `@lid`. `addAlias` only rewrites messages for lids in here.
-- `search_blocks(blk, chat, start, last, n, bloom)`: the search filters. See below.
+- `messages(chat, id, ts, from_me, sender, type, data)`: `chat` and `sender` are pids; `data` is sealed `{ body, push name, sender jid, media ref, transcript, quote }`. Edits rewrite it; deletes set it to `[deleted]`.
+- `chats`, `contacts`, `custom_names`: `cid` is the pid of the jid; the sealed record holds the jid and names. Names resolve in memory through `names.ts`.
+- `alias`: maps anonymous `@lid` ids to phone-number jids, so one person is one chat. `lid_senders` lists senders still under an unmapped lid.
+- `auth`: Baileys credentials and signal keys, key names hashed too.
+- `meta`, `account`: `last_pull`, `paired`, `tz`, login throttling, a sealed canary, schema and index versions; the account record.
+- `chat_stats`: per-chat count and newest timestamp, kept by triggers, so counting never scans. Don't use `INSERT OR REPLACE` on `messages`; a replace skips delete triggers.
+- `search_blocks`: the search filters.
+- `notes(id, chat, created, due, done, data)`: `chat` is a pid and `data` the sealed text; `due` and `done` stay readable so reminders can be listed without the key's help in SQL.
 
-Keep new work in `store.ts` in the same shape: a query that needs a name or a number is answered in JavaScript from the snapshot, not in SQL.
+A new table that holds user content stores a `vault.pid` for anything it indexes and a sealed blob for the rest, with its own AAD letter (constants at the top of `store.ts`).
 
 ## Searching encrypted messages
 
-The database can't look inside message text, because it's sealed. The first version answered every search by decrypting the whole history, newest first. That works, and it costs a full read of every message per search.
+Each chat's timeline is cut into blocks of about 128 messages. Each block has a Bloom filter of 16,384 bits, 4 bits per word and per word prefix of one to four letters, chosen by an HMAC under a key derived from the data key.
 
-Now each chat's timeline is cut into blocks of about 128 messages (`search-index.ts`). Each block has a Bloom filter: 16,384 bits, with 4 bits set for every word that appears in the block, and for each word's first one to four letters, so `lunch*` works. Which 4 bits is decided by an HMAC of the word under a key derived from the user's data key. So:
-
-- A search hashes its words the same way and checks each block's bits. One bit off means the word is certainly not in that block, and the block is never read. All bits on means it probably is, so the block's messages are decrypted and matched properly. The filter only decides what to read; the match itself is the same whole-word match as always, so results are exactly what a full scan would give. The tests check that against a brute-force scan.
-- Blocks are read newest first and the search stops once every query has its `limit` matches newer than anything left. A rare word costs about one block per match. A word that appears nowhere costs one row per block and nothing else.
-- Without the key, a filter is a bit array with some fraction of bits set. That reveals roughly how many distinct words a block has, which says little beyond the message lengths that are already visible. It doesn't reveal which words, how often each appears, or whether two blocks share a word. Someone with the key can already decrypt the messages.
-- Bits are only ever added. An edit adds the new words and a delete leaves the old ones, so a filter can grow stale but never wrong: stale bits cost an extra block read, never a missed match.
-- A block covers its chat from its `start` up to the next block's `start`. Live messages land in the newest block until it holds 128, then a new one starts. History that arrives out of order goes into whichever block covers its time, and a block that grows past 256 is recut from its messages. When a lid chat is merged into a phone number, the number's blocks are rebuilt.
-- Filter updates are collected for the whole ingest batch and written once per block touched, not once per message.
+- A search hashes its words the same way. One bit off means the word is not in that block and the block is skipped; otherwise the block is decrypted and matched properly, so results equal a full scan (the tests check this against brute force).
+- Blocks are read newest first and the search stops once every query has its matches.
+- Bits are only ever added, so a filter can grow stale but never wrong.
+- Changing `fold`, `core`, `entriesOf` or `needsOf` bumps `INDEX_VERSION`, which rebuilds filters on the next search. The query side (`matches`/`hasTerm` in `store.ts`) must apply the same `core`.
 
 ## What costs money
 
-On Durable Objects, SQLite is billed by rows read and rows written, and a row written costs about a thousand times a row read. Index rows count as rows. So:
+Durable Object SQLite bills rows read and written, and a write costs about a thousand reads.
 
-- Don't add an index to `messages` casually. It is one more row written for every message, forever. `lid_senders` exists because an index on `sender` would have cost more than the scan it saved.
-- Don't count or group over `messages` on a hot path. Status polls, `list_chats` and the size check used to, and at a hundred users that was most of the bill. Use `chat_stats`.
-- Batch writes to the small tables. One write per chat or block per ingest batch is fine; one per message adds up.
-- Reads are cheap until they're full scans of big histories on every request. Then they're the bill.
+- Don't add an index to `messages` casually: it is one more row written per message, forever.
+- Don't count or group over `messages` on a hot path; use `chat_stats`.
+- Batch writes to the small tables: one per chat or block per ingest batch.
+- Ingest is idempotent, which is what makes relinking safe.
 
-Ingest is idempotent. Re-importing history inserts what's missing and fills in a missing sender or push name, and never duplicates. That is what makes relinking safe.
+## Before changing the Baileys parts
 
-Opening a database from the plaintext version, `unlock()` runs `migrateLegacy` once: it renames the old tables, creates the new ones, copies everything across sealed, and drops the old tables, all in one transaction.
-
-## What to know before changing things
-
-These all cost real time to find. Read them before touching the Baileys parts.
-
-1. **Baileys needs three shims to run on workerd.**
-   - `ws`: the package needs Node sockets. `ws-shim.ts` wraps the Workers WebSocket, opened with `fetch()` and an `Upgrade` header because that's the only way to set the `Origin` header WhatsApp checks.
-   - `whatsapp-rust-bridge`: it ships its wasm as base64 and compiles it at runtime, which workerd forbids. `vendor-bridge.mjs` writes the wasm to a file and patches the loader to import it as a `CompiledWasm` module. The `vendor/` folder is generated, not committed.
-   - Timers: Node timers have `.unref()` and workerd's don't. `polyfills.ts` adds it. It must be the first import in both the Worker and the Durable Object module.
-2. **`lru-cache` autopurge breaks the first import.** Baileys creates caches with `ttlAutopurge: true`, which starts one `setTimeout` per entry. workerd allows 10,000 pending timers per object, and the first history sync blows through that with `QuotaExceededError`. `lru-shim.ts` turns autopurge off. Expired entries are still dropped lazily on access.
-3. **QR pairing never sets `creds.registered`.** That flag belongs to the mobile registration flow. "Is this linked" is `creds.me?.id`.
-4. **History comes once per link.** If a first import fails halfway, that history is gone until you relink. Don't ship a change to ingest code without testing it against a real first link.
-5. **Group senders arrive in two places.** Live messages have `key.participant`. History messages put it on `msg.participant`. Read both.
-6. **Pin Baileys exactly.** It's a prerelease and its API moves between release candidates.
-7. **Deploys don't evict a busy Durable Object.** An object with an active session keeps running old code until the session ends. Renaming the class with a migration didn't evict it either. If you've shipped a fix and the object still misbehaves, stop sending it requests and wait three to five minutes. Every probe, including `/debug`, resets its idle timer, so polling a stale object keeps it stale. Baileys also leaks interval timers when a socket closes; `finish()` in `whatsapp-do.ts` clears them so the object can go idle at all.
-8. **Logging out takes two steps.** `logout()` first connects and calls Baileys' `logout()`, so the device disappears from the phone's list, then clears local credentials. If the first step fails it says so in the debug events, and the user has to remove the device by hand.
-9. **WhatsApp stores a placeholder where a name should be.** Chats it has no contact for are named after the number, sometimes masked (`+972∙∙∙∙∙∙∙20`), in the chat name and the contact name. `numberLike` in `store.ts` treats those as no name, and ingest refuses to store them. Before that fix a placeholder outranked a real saved name.
-10. **Don't call `markOnlineOnConnect`.** It's set to false on purpose. Marking the linked device online makes the phone stop showing notifications.
+1. **Baileys needs three shims on workerd.** `ws-shim.ts` wraps the Workers WebSocket (opened with `fetch()` and an `Upgrade` header, the only way to set the `Origin` WhatsApp checks). `vendor-bridge.mjs` writes the Rust bridge's wasm to a file, because workerd forbids compiling it at runtime; `vendor/` is generated. `polyfills.ts` adds `.unref()` to timers and must be the first import.
+2. **`lru-cache` autopurge breaks the first import** by starting one timer per entry past workerd's 10,000 limit. `lru-shim.ts` turns it off.
+3. **QR pairing never sets `creds.registered`.** "Is this linked" is `creds.me?.id`.
+4. **History comes once per link.** Don't ship an ingest change without testing it against a real first link.
+5. **Group senders arrive in two places:** `key.participant` live, `msg.participant` in history.
+6. **Baileys is pinned to `7.0.0-rc14`.** The `postinstall` patch depends on it; upgrade only with a real link test.
+7. **Deploys don't evict a busy Durable Object.** If a fix doesn't take, stop sending requests for three to five minutes; every probe resets the idle timer.
+8. **Logging out takes two steps:** connect and call Baileys' `logout()` so the device leaves the phone's list, then clear local credentials.
+9. **WhatsApp stores placeholders as names** (the number, sometimes masked). `numberLike` treats them as no name.
+10. **Keep `markOnlineOnConnect: false`.** Marking the device online stops the phone's notifications.
 
 ## Configuration
 
-| Name | Kind | Purpose |
+| Name | Kind | Value here |
 | --- | --- | --- |
-| `WA_OWNER_PASSWORD` | secret | Single-user mode: set it and the server is for one person. 12+ characters. The first sign-in creates the account. Leave it unset for many-user mode. |
-| `OPEN_SIGNUP` | var, optional | `"true"` turns on many-user mode: Google sign-in through the login service. |
-| `LOGIN_URL` | var, optional | The login service. Defaults to `https://login.finereli.com`. |
-| `SIGNUP_LIMIT` | var, optional | Most accounts in many-user mode. Unset or `0`: no cap. |
-| `MAX_MESSAGES`, `MAX_DB_MB` | var, optional | Most messages and storage in one account. Defaults in many-user mode: 250000 and 300. `0` means no cap. |
-| `ALERT_EMAIL`, `ALERT_TO`, `ALERT_FROM` | send_email binding and vars, optional | Where to email the operator when seats run low and run out. |
-| `CONTACT_X` | var, optional | Your X handle, shown where people are told to get in touch. |
-| `OPERATOR_NAME` | var, optional | Shown on the privacy page and terms as who runs this server. |
-| `TIMEZONE` | var, optional | IANA zone for timestamps, e.g. `Asia/Riyadh`. When set it wins over the zone saved at sign-up, so it can be set or changed after the account exists. Otherwise each account uses the zone of the browser it signed up from. |
-| `DEFAULT_COUNTRY_CODE` | var, optional | Country code (digits, no plus), used when your agent saves a number written without one, e.g. `972`. |
-| `WA_PIN` | secret, optional | 32+ random characters. Enables the `/debug` routes via an `x-pin` header. Leave it unset to leave them off. |
-| `OAUTH_KV` | binding | Token store for the OAuth provider and pending sign-ins. |
-| `WA` | binding | The per-person Durable Object. |
-| `REGISTRY` | binding | One Durable Object that counts accounts, so `SIGNUP_LIMIT` is a real cap. |
+| `WA_OWNER_PASSWORD` | secret | Set. Single-user mode; 12+ characters. |
+| `WA_PIN` | secret, optional | Turns on `/debug` with an `x-pin` header. 32+ characters. |
+| `TIMEZONE` | var | `Asia/Riyadh`. Wins over the zone saved at sign-up. |
+| `DEFAULT_COUNTRY_CODE` | var | `966`. For numbers saved without a country code. |
+| `AI` | Workers AI binding | Set. Turns on `transcribe_audio`. |
+| `TRANSCRIBE_MODEL` | var, optional | Unset, so `@cf/openai/whisper-large-v3-turbo`. |
+| `OAUTH_KV` | KV binding | Namespace named `WA_OAUTH_KV`; the binding name can't change because the OAuth library reads `env.OAUTH_KV`. |
+| `WA` | Durable Object | `WhatsAppStore`, one instance named `owner`. |
+| `REGISTRY` | Durable Object | `Registry`, upstream's seat counter; bound but unused here. |
+| `OPEN_SIGNUP` | var | Must stay unset, so the upstream login service is never used. |
 
-Keep a deployment's own values (domain, KV id) in `wrangler.local.jsonc`, which is gitignored, and `npm run deploy` uses it when it exists (`wrangler.jsonc` otherwise). `wrangler.jsonc` is the template other people start from.
-
-Lost that file, or deploying from a new machine? `CLOUDFLARE_API_TOKEN=... node scripts/pull-config.mjs` rebuilds it from the live Worker: vars, KV and Durable Object bindings, email, custom domains, crons and limits, with `wrangler.jsonc` filling in what Cloudflare doesn't report. Secrets stay on Cloudflare and are only listed by name. If the live Worker has applied more Durable Object migrations than `wrangler.jsonc` lists (because it was once deployed from a config with its own steps), the script pads the list with empty placeholder steps up to the live tag; without them, wrangler refuses to deploy. Check the result with `npx wrangler deploy -c wrangler.local.jsonc --dry-run`.
-
-## Adapting it
-
-- **Add a tool.** Register it in `mcp.ts` and put the SQL in `store.ts`. Read tools should call `fresh()` first. Keep tools read-only unless you mean otherwise. If a failure leaves an agent stuck, say in the tool result what to try next, the way `NAME_HINT` does for missing names.
-- **Change who can sign in.** `signIn` and `signInWithLogin` in `auth.ts` are the only places that turn a login into an identity. Anything you add has to produce the data key, so it has to start from a secret: a password only the person knows, or a key a service derives for them (which the service's operator can derive too).
-- **Offer an opt-in background sync.** Today nothing can decrypt when nobody is signed in, so there is no scheduled pull. A "keep syncing" setting could store the data key wrapped by a server secret. That is a weaker mode and should be labeled as one. Don't make it the default.
-- **Add a way to change the password.** `rewrap` in `vault.ts` does the cryptography, and `replaceAccount` in the Durable Object stores the result. Nothing calls them yet.
-- **Other ways to fill in names.** Anything that can produce `{ jid, name }` rows can call `store.setCustomNames`. A CSV upload, a CardDAV pull or a scheduled job would all work. The agent route exists so the server needs no credentials for any of them.
-- **Sending messages.** Not built, on purpose. Think hard before adding it.
+`wrangler.jsonc` is this deployment's real config and is committed; there is no `wrangler.local.jsonc`.
 
 ## Debugging
 
-With `WA_PIN` set, `/debug` returns JSON and needs the header `x-pin: <WA_PIN>`. Add `?u=<user id>` for a many-user deployment (the id is the hash the object is named by; single-user mode needs nothing). It shows session phase, whether a phone is linked, whether the object currently has a key, the message count, and the last events from the session (connection changes, history chunk sizes, errors). It shows no message content, because the operator has no key, and that is on purpose. There are no routes to read chats, run SQL or pull: they would need a key.
+With `WA_PIN` set, `GET /debug` with header `x-pin: <WA_PIN>` returns the session phase, whether a phone is linked, whether the object has a key, the message count and the last session events. It shows no message content, names or numbers, on purpose. Logs carry counts and timings only.
 
-Local development: `npm run dev` with a `.dev.vars` containing `WA_OWNER_PASSWORD=...` (12+ characters). It runs a local Durable Object with its own empty storage, so you can exercise the sign-in flow and see a real QR code, but linking a phone from local dev makes a second linked device.
+Local: `npm run dev` with a `.dev.vars` containing `WA_OWNER_PASSWORD=...`. Linking a phone from local dev makes a second linked device, so avoid it on the business number.
 
-To test the pairing UI states without a phone, serve the page with a mocked `/pair/status`. Everything the page needs is that one JSON shape: `paired`, `running`, `progress`, `qrSvg`, `messages`, `chats`.
+## Making a change
 
-## Checking a change
-
-1. `npm run typecheck`, then `npm test`. The test runs the real store, vault and auth state against Node's built-in SQLite (Node 22.13 or later): the cryptography, names, search (checked against a brute-force scan of a few thousand messages arriving out of order), the running counts, the migration from the plaintext version, and a check that no message, name or number can be found in a dump of the database. It also checks that the check itself can fail, by running it on an unmigrated database.
-2. Anything that touches SQL types needs a run inside the real runtime too, because Node's SQLite isn't the Durable Object's (BLOB binding, cursors, DDL inside a transaction). A throwaway Durable Object that imports `store.ts` and runs under `wrangler dev` is enough.
-3. Deploy, sign in, link a phone, and call `link_status`, then `list_chats`, then `get_messages` on a Hebrew or emoji-heavy chat, then `search_messages` with two or three queries at once. Then `unnamed_chats`, and `set_contact_names` on one number, and confirm the chat shows the name.
-4. If you touched ingest, relink and confirm the stored message count doesn't grow (re-import is idempotent) and that group messages show real sender names.
-5. If you touched anything that stores data, dump the SQLite and look for a name or a number in it.
+1. Work on a feature branch. `main` is merged and deployed with `npm run deploy`.
+2. `npm ci`, then add tests beside the code they cover (`test/store`, `history`, `names`, `translate`, `digest-render`).
+3. Done means all three pass: `npm test`, `npm run typecheck`, `npx wrangler deploy --dry-run --outdir /tmp/dryrun`.
+4. Update this README and `AGENTS.md` when a tool, secret or invariant changes.
 
 ## Known gaps
 
-- Chats with no name in WhatsApp and none saved show as phone numbers. Nothing refreshes names by itself: they only get saved when an agent (or you) does it.
-- If WhatsApp has logged the device out, nothing tells you. `link_status` shows it the next time your agent asks.
-- Nothing changes a password yet (see "Adapting it").
-- Signup is capped by `SIGNUP_LIMIT` and nothing else. Google proves the email, so there is no verification of our own.
-- The login service holds a master secret. Lose it and every hosted account is unreadable; leak it together with the database and every account is readable.
-- Wrong-password lockouts apply to the password mode only, per account, so someone who knows the owner's setup could lock the owner out of signing in for up to an hour. Agents that are already connected keep working.
-- Search is fast for rare words and slower for common ones, which match in most blocks anyway. A one-letter prefix search (`a*`) reads nearly everything.
-- Edits and deletes are applied when they arrive as protocol messages. That path hasn't been tested against real ones.
-- It's only been exercised against one real account.
+- Chats with no name in WhatsApp and none saved show as numbers until an assistant or I save one.
+- If WhatsApp logs the device out, nothing says so until the next `link_status`.
+- Nothing changes the password yet (`rewrap` in `vault.ts` and `replaceAccount` exist; nothing calls them).
+- Wrong-password lockouts can lock the owner out of new sign-ins for up to an hour; connected assistants keep working.
+- `get_media` follows the download location in the message without checking its host, so a crafted message can make the Worker fetch another address.
+- One-letter prefix searches (`a*`) read nearly everything.
 
-## License
+## Origin and license
 
-MIT
+Cloned from [finereli/whatsapp-mcp](https://github.com/finereli/whatsapp-mcp) by [@finereli](https://x.com/finereli), imported as one commit from upstream `b49d494`. There is no shared git history. To take an upstream fix, add the remote, read `git log upstream/main` since `b49d494`, and port the change by hand, keeping this fork's renames (`WA_OWNER_PASSWORD`, `WA_PIN`, the `WA_OAUTH_KV` namespace) and additions (the chat viewer, `get_context`, `chat_activity`, notes and `daily_digest`, Arabic search, the longer sync windows).
+
+MIT, as upstream.

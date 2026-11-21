@@ -25,8 +25,11 @@ export interface Live {
   lastPull(): number | Promise<number>;
 }
 
-/** How long stored messages count as fresh before a read pulls from WhatsApp first. */
-export const FRESH = { read: 10 * 60_000, button: 60_000 } as const;
+/**
+ * How long stored messages count as fresh before a read pulls from WhatsApp first. Each pull is a fresh login from a
+ * Cloudflare IP, so these are kept long to keep logins rare on a business number; sync_now pulls on demand.
+ */
+export const FRESH = { read: 30 * 60_000, button: 5 * 60_000 } as const;
 /** Default look-back windows, in days. */
 export const WINDOW = { unanswered: 14, activity: 7 } as const;
 

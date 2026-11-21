@@ -65,6 +65,10 @@
 		}
 	],
 	// First history import decodes a lot of protobuf; the default CPU budget is too small. Needs Workers Paid.
+	// Workers AI: turns on transcribe_audio (voice notes to text, about $0.0005 a minute of audio).
+	"ai": {
+		"binding": "AI"
+	},
 	"limits": {
 		"cpu_ms": 300000
 	},
